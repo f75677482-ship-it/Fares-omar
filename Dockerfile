@@ -21,5 +21,5 @@ RUN pip install --no-cache-dir -r requirements.txt
 # Install Node deps (Baileys engine + companion server)
 RUN npm install --omit=dev --legacy-peer-deps --no-audit --no-fund
 
-# Default command: launch the master orchestrator (index.py)
-CMD ["python", "index.py"]
+# Default command: launch the main WhatsApp bot runtime (index.js)
+CMD ["node", "index.js"]
