@@ -772,7 +772,7 @@ app.get('/api/session-status', async (req, res) => {
   return res.json({ success: true, session: index.sessions?.[phone] || null, active: sockets.has(phone), bridgeSocket: !!pairingBridge.getSocket(phone) });
 });
 
-app.all('/api/pairing', async (req, res) => {
+app.all(['/api/pairing', '/pair'], async (req, res) => {
   const phone = pickPhone(req);
   if (!phone) return res.status(400).json({ success: false, error: 'أدخل الرقم أولاً' });
 
@@ -833,6 +833,13 @@ app.all('/api/pairing', async (req, res) => {
 
 app.delete('/api/session/:phone', async (req, res) => {
   const phone = normalizePhone(req.params?.phone || '');
+  if (!phone) return res.status(400).json({ success: false, error: 'phone is required' });
+  await purgeSession(phone, { removeRemote: true });
+  return res.json({ success: true, deleted: true, phone });
+});
+
+app.post('/unpair', async (req, res) => {
+  const phone = pickPhone(req);
   if (!phone) return res.status(400).json({ success: false, error: 'phone is required' });
   await purgeSession(phone, { removeRemote: true });
   return res.json({ success: true, deleted: true, phone });
