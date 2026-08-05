@@ -13,7 +13,7 @@
     "install:panel": "npm install --legacy-peer-deps",
     "install:force": "npm install --force",
     "test": "node --check index.js && echo \"index.js syntax ok\""
-  }
+  },
   "keywords": ["whatsapp-bot", "telegram-bot", "multi-session"],
   "author": "Fares Omar",
   "license": "ISC",
