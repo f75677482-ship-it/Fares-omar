@@ -1,25 +1,25 @@
-# استخدام صورة أساسية تحتوي على نظام لينكس مدمج معه بيئة بايثون
-FROM python:3.10-slim
+# Image base: python slim + Node 20 (required for baileys per-number workers)
+FROM python:3.11-slim
 
-# تثبيت Node.js و npm و git والأدوات الأساسية للنظام
-RUN apt-get update && apt-get install -y \
+# Install Node.js 20 + git + build tools (needed by some native deps like sharp)
+RUN apt-get update && apt-get install -y --no-install-recommends \
     curl \
+    ca-certificates \
     git \
     && curl -fsSL https://deb.nodesource.com/setup_20.x | bash - \
-    && apt-get install -y nodejs \
+    && apt-get install -y --no-install-recommends nodejs \
     && rm -rf /var/lib/apt/lists/*
 
-# تحديد مجلد العمل داخل السيرفر
 WORKDIR /app
 
-# نسخ ملفات المشروع بالكامل إلى الحاوية
+# Copy project
 COPY . .
 
-# تثبيت مكتبات بايثون
+# Install Python deps
 RUN pip install --no-cache-dir -r requirements.txt
 
-# تثبيت مكتبات Node.js مباشرة من المجلد الحالي (لأن الملفات كلها في الجذر)
+# Install Node deps (Baileys engine + companion server)
 RUN npm install --omit=dev --legacy-peer-deps --no-audit --no-fund
 
-# تحديد الأمر الإفتراضي عند تشغيل الحاوية (تشغيل ملف بايثون الرئيسي)
-CMD ["python", "bot_core.py"]
+# Default command: launch the master orchestrator (index.py)
+CMD ["python", "index.py"]

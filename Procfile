@@ -1,1 +1,1 @@
-web: python bot_core.py
+web: python index.py
