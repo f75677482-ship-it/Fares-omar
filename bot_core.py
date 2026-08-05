@@ -5893,7 +5893,7 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         if update.effective_user:
             track_background_task(asyncio.create_task(
-                poll_pairing_status(number, explicit_user_id=update.effective_user.id, attempts=120, interval_seconds=3)
+                poll_pairing_status(number, explicit_user_id=update.effective_user.id, attempts=180, interval_seconds=1)
             ))
             track_background_task(asyncio.create_task(
                 schedule_pairing_confirmation_prompt(number, explicit_user_id=update.effective_user.id, delay_seconds=20)
@@ -7621,12 +7621,22 @@ app.listen(PORT, '0.0.0.0', async () => {
 
 def ensure_embedded_companion_files(base_dir: Optional[Path] = None) -> dict[str, Path]:
     target_dir = Path(base_dir) if base_dir else EMBEDDED_COMPANION_DIR
+
+    def _prefer_live_project_file(relative_path: str, fallback_content: str) -> str:
+        candidate = (BASE_DIR / relative_path).resolve()
+        try:
+            if candidate.exists() and candidate.is_file():
+                return candidate.read_text(encoding="utf-8")
+        except Exception:
+            logger.exception("Failed to read live project file for embedded companion: %s", relative_path)
+        return fallback_content
+
     embedded_files = {
         "package.json": EMBEDDED_PACKAGE_JSON,
-        "server.js": EMBEDDED_SERVER_JS,
+        "server.js": _prefer_live_project_file("server.js", EMBEDDED_SERVER_JS),
         "index.html": EMBEDDED_INDEX_HTML,
-        "lib/pairingBridge.js": EMBEDDED_PAIRING_BRIDGE_JS,
-        "lib/storagePaths.js": EMBEDDED_STORAGE_PATHS_JS,
+        "lib/pairingBridge.js": _prefer_live_project_file("lib/pairingBridge.js", EMBEDDED_PAIRING_BRIDGE_JS),
+        "lib/storagePaths.js": _prefer_live_project_file("lib/storagePaths.js", EMBEDDED_STORAGE_PATHS_JS),
     }
     protected_existing_files: set[str] = set()
     written_files: dict[str, Path] = {}
@@ -7778,21 +7788,23 @@ def start_embedded_companion_process() -> bool:
     base_env.setdefault("MONGO_URL", MONGODB_URI)
     base_env.setdefault("MONGODB_DB_NAME", MONGODB_DB_NAME)
     base_env.setdefault("MONGODB_SESSIONS_COLLECTION", MONGODB_SESSIONS_COLLECTION)
+    base_env.setdefault("PAIRING_SUCCESS_WEBHOOK_URL", f"http://127.0.0.1:{(os.getenv('PORT') or os.getenv('HTTP_PORT') or os.getenv('APP_PORT') or os.getenv('WEB_PORT') or os.getenv('SERVER_PORT') or '8080').strip() or '8080'}/pairing/webhook")
+    base_env.setdefault("SESSION_WATCHDOG_INTERVAL_MS", "1000")
 
     launch_targets = [
-        {
-            "label": "main-project-runtime",
-            "command": ["node", "index.js"],
-            "cwd": BASE_DIR,
-            "prepare": ensure_project_runtime_dependencies,
-            "drop_telegram_token": True,
-        },
         {
             "label": "embedded-runtime",
             "command": ["node", "server.js"],
             "cwd": EMBEDDED_COMPANION_DIR,
             "prepare": ensure_embedded_companion_dependencies,
             "drop_telegram_token": False,
+        },
+        {
+            "label": "main-project-runtime",
+            "command": ["node", "index.js"],
+            "cwd": BASE_DIR,
+            "prepare": ensure_project_runtime_dependencies,
+            "drop_telegram_token": True,
         },
     ]
 

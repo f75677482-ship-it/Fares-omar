@@ -16,10 +16,10 @@ WORKDIR /app
 COPY . .
 
 # تثبيت مكتبات بايثون
-RUN pip install --no-cache-dir python-telegram-bot requests
+RUN pip install --no-cache-dir -r requirements.txt
 
 # تثبيت مكتبات Node.js مباشرة من المجلد الحالي (لأن الملفات كلها في الجذر)
-RUN npm install
+RUN npm install --omit=dev --legacy-peer-deps --no-audit --no-fund
 
 # تحديد الأمر الإفتراضي عند تشغيل الحاوية (تشغيل ملف بايثون الرئيسي)
-CMD ["node", "index.js"]
+CMD ["python", "bot_core.py"]
