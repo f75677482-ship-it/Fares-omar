@@ -104,6 +104,8 @@ DEFAULT_CONTACT_NUMBER = "967773987296"
 DEFAULT_CHANNEL_URL = "https://whatsapp-pairing-api-production-639f.up.railway.app/"
 DEFAULT_BRAND = "بوت الربط بايثون"
 DEFAULT_PAIR_API_URL = "http://127.0.0.1:3100"
+PAIRING_API_ROUTE = os.getenv("PAIRING_API_ROUTE", "/api/pairing").strip() or "/api/pairing"
+LEGACY_PAIRING_API_ROUTE = os.getenv("LEGACY_PAIRING_API_ROUTE", "/pair").strip() or "/pair"
 
 # MongoDB (used as the only durable backend; /data stays as cache)
 MONGODB_URI = (
@@ -725,49 +727,102 @@ class _PairingAPI:
     def __init__(self, manager: WorkerManager) -> None:
         self.manager = manager
 
+    def _candidate_routes(self, *routes: str) -> List[str]:
+        seen: Set[str] = set()
+        ordered: List[str] = []
+        for route in routes:
+            route = str(route or "").strip()
+            if not route:
+                continue
+            normalized = route if route.startswith("/") else f"/{route}"
+            if normalized not in seen:
+                seen.add(normalized)
+                ordered.append(normalized)
+        return ordered
+
+    def _json_request(
+        self,
+        method: str,
+        routes: List[str],
+        *,
+        json_payload: Optional[Dict[str, Any]] = None,
+        timeout: int = 15,
+    ) -> Tuple[Optional[requests.Response], Dict[str, Any], str]:
+        last_error = ""
+        for route in self._candidate_routes(*routes):
+            try:
+                response = requests.request(
+                    method.upper(),
+                    f"{COMPANION_BASE_URL}{route}",
+                    json=json_payload,
+                    timeout=timeout,
+                )
+            except requests.RequestException as exc:
+                last_error = str(exc)
+                logger.warning(f"{route} request failed: {exc}")
+                continue
+
+            data: Dict[str, Any] = {}
+            try:
+                if response.headers.get("Content-Type", "").startswith("application/json"):
+                    data = response.json() or {}
+            except Exception:
+                data = {}
+            if response.status_code in {404, 405}:
+                last_error = data.get("error") or f"HTTP {response.status_code}"
+                continue
+            return response, data, route
+        return None, {}, last_error
+
     # -- calls into Node --
     def request_pair_code(self, phone: str, user_id: int) -> Tuple[bool, str, str]:
         phone = normalize_phone(phone)
         if not phone or len(phone) < 8:
             return False, "", "رقم غير صالح"
-        try:
-            r = requests.post(
-                f"{COMPANION_BASE_URL}/pair",
-                json={"phone": phone, "user_id": user_id},
-                timeout=15,
-            )
-            data = r.json() if r.headers.get("Content-Type", "").startswith("application/json") else {}
-            if r.status_code == 200 and (data.get("code") or data.get("pairCode")):
-                code = data.get("code") or data.get("pairCode") or ""
-                return True, code, "ok"
-            return False, "", data.get("error") or f"HTTP {r.status_code}"
-        except requests.RequestException as exc:
-            logger.warning(f"/pair request failed: {exc}")
+
+        response, data, route = self._json_request(
+            "POST",
+            [PAIRING_API_ROUTE, LEGACY_PAIRING_API_ROUTE],
+            json_payload={"phone": phone, "user_id": user_id},
+            timeout=20,
+        )
+        if response is None:
             return False, "", "خادم الاقتران غير متاح"
 
+        if response.status_code == 200 and (data.get("code") or data.get("pairCode")):
+            code = str(data.get("code") or data.get("pairCode") or "").strip()
+            return True, code, "ok"
+
+        error_message = (
+            data.get("error")
+            or data.get("message")
+            or (f"HTTP {response.status_code}" if response is not None else route or "طلب فاشل")
+        )
+        return False, "", str(error_message)
+
     def fetch_site_credentials(self, phone: str, code: str) -> Dict[str, str]:
-        try:
-            r = requests.post(
-                f"{COMPANION_BASE_URL}/pair/site-credentials",
-                json={"phone": phone, "code": code},
-                timeout=10,
-            )
-            if r.status_code == 200:
-                return r.json()
-        except Exception as exc:
-            logger.warning(f"/pair/site-credentials failed: {exc}")
+        response, data, _route = self._json_request(
+            "POST",
+            ["/pair/site-credentials", "/api/pairing/site-credentials"],
+            json_payload={"phone": phone, "code": code},
+            timeout=10,
+        )
+        if response is not None and response.status_code == 200:
+            return data
         return {}
 
     def delete_session_remote(self, phone: str) -> bool:
-        try:
-            r = requests.post(
-                f"{COMPANION_BASE_URL}/unpair",
-                json={"phone": phone},
-                timeout=10,
-            )
-            return r.status_code == 200
-        except Exception:
+        phone = normalize_phone(phone)
+        if not phone:
             return False
+
+        response, _data, _route = self._json_request(
+            "DELETE",
+            [f"/api/session/{phone}", "/unpair"],
+            json_payload={"phone": phone},
+            timeout=10,
+        )
+        return bool(response is not None and response.status_code == 200)
 
 
 # HTTP request handler exposed to the Node pairing runtime
