@@ -140,28 +140,10 @@ ${repoUrl}`;
     const payload = hasImage
       ? {
           image: fs.readFileSync(imagePath),
-          caption: helpMessage,
-          templateButtons: [
-            {
-              index: 1,
-              quickReplyButton: {
-                displayText: 'معلومات المالك',
-                id: 'owner'
-              }
-            }
-          ]
+          caption: helpMessage
         }
       : {
-          text: helpMessage,
-          templateButtons: [
-            {
-              index: 1,
-              quickReplyButton: {
-                displayText: 'معلومات المالك',
-                id: 'owner'
-              }
-            }
-          ]
+          text: helpMessage
         };
 
     await sock.sendMessage(chatId, payload, { quoted: message });
