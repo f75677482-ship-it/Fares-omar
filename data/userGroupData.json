@@ -2,11 +2,13 @@
   "users": [],
   "groups": [],
   "antilink": {},
+  "antitag": {},
   "antibadword": {},
   "warnings": {},
   "sudo": [],
   "welcome": {},
   "goodbye": {},
   "chatbot": {},
-  "autoReaction": false
+  "autoReaction": false,
+  "messageCount": {}
 }

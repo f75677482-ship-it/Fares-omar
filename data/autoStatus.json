@@ -1,1 +1,4 @@
-{"enabled":false}
+{
+  "global": "off",
+  "groups": {}
+}
