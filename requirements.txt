@@ -1,3 +1,10 @@
 requests>=2.31.0
-python-telegram-bot>=20,<23
+python-telegram-bot>=20.7,<23
 pymongo[srv]>=4.6.0
+aiohttp>=3.9.0
+Pillow>=10.0.0
+deep-translator>=1.11.4
+python-dotenv>=1.0.0
+qrcode>=7.4.2
+yt-dlp>=2024.5.27
+aiofiles>=23.2.1
