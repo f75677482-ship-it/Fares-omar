@@ -1,256 +1,337 @@
-diff --git a/Dockerfile b/Dockerfile
-index 2716b28..3427974 100644
---- a/Dockerfile
-+++ b/Dockerfile
-@@ -16,10 +16,10 @@ WORKDIR /app
- COPY . .
+diff --git a/commands/clearsession.js b/commands/clearsession.js
+index 5df858e..481c642 100644
+--- a/commands/clearsession.js
++++ b/commands/clearsession.js
+@@ -1,5 +1,9 @@
++const fs = require('fs');
++const path = require('path');
+ const { listMongoSessionJsonFiles, clearMongoSessionAuthFiles, deleteMongoSessionSnapshot } = require('../mongo-auth');
+ const isOwnerOrSudo = require('../lib/isOwner');
++const { DATA_DIR, SESSION_ROOT } = require('../lib/storagePaths');
++const { deleteRemotePhoneSettings } = require('../lib/remotePhoneSettingsStore');
  
- # تثبيت مكتبات بايثون
--RUN pip install --no-cache-dir python-telegram-bot requests
-+RUN pip install --no-cache-dir -r requirements.txt
- 
- # تثبيت مكتبات Node.js مباشرة من المجلد الحالي (لأن الملفات كلها في الجذر)
--RUN npm install
-+RUN npm install --omit=dev --legacy-peer-deps --no-audit --no-fund
- 
- # تحديد الأمر الإفتراضي عند تشغيل الحاوية (تشغيل ملف بايثون الرئيسي)
--CMD ["node", "index.js"]
-+CMD ["python", "bot_core.py"]
-diff --git a/bot_core.py b/bot_core.py
-index 5db79e5..5eeaa50 100644
---- a/bot_core.py
-+++ b/bot_core.py
-@@ -5893,7 +5893,7 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
-         )
-         if update.effective_user:
-             track_background_task(asyncio.create_task(
--                poll_pairing_status(number, explicit_user_id=update.effective_user.id, attempts=120, interval_seconds=3)
-+                poll_pairing_status(number, explicit_user_id=update.effective_user.id, attempts=180, interval_seconds=1)
-             ))
-             track_background_task(asyncio.create_task(
-                 schedule_pairing_confirmation_prompt(number, explicit_user_id=update.effective_user.id, delay_seconds=20)
-@@ -7621,12 +7621,22 @@ app.listen(PORT, '0.0.0.0', async () => {
- 
- def ensure_embedded_companion_files(base_dir: Optional[Path] = None) -> dict[str, Path]:
-     target_dir = Path(base_dir) if base_dir else EMBEDDED_COMPANION_DIR
-+
-+    def _prefer_live_project_file(relative_path: str, fallback_content: str) -> str:
-+        candidate = (BASE_DIR / relative_path).resolve()
-+        try:
-+            if candidate.exists() and candidate.is_file():
-+                return candidate.read_text(encoding="utf-8")
-+        except Exception:
-+            logger.exception("Failed to read live project file for embedded companion: %s", relative_path)
-+        return fallback_content
-+
-     embedded_files = {
-         "package.json": EMBEDDED_PACKAGE_JSON,
--        "server.js": EMBEDDED_SERVER_JS,
-+        "server.js": _prefer_live_project_file("server.js", EMBEDDED_SERVER_JS),
-         "index.html": EMBEDDED_INDEX_HTML,
--        "lib/pairingBridge.js": EMBEDDED_PAIRING_BRIDGE_JS,
--        "lib/storagePaths.js": EMBEDDED_STORAGE_PATHS_JS,
-+        "lib/pairingBridge.js": _prefer_live_project_file("lib/pairingBridge.js", EMBEDDED_PAIRING_BRIDGE_JS),
-+        "lib/storagePaths.js": _prefer_live_project_file("lib/storagePaths.js", EMBEDDED_STORAGE_PATHS_JS),
+ const channelInfo = {
+     contextInfo: {
+@@ -13,10 +17,105 @@ const channelInfo = {
      }
-     protected_existing_files: set[str] = set()
-     written_files: dict[str, Path] = {}
-@@ -7778,15 +7788,10 @@ def start_embedded_companion_process() -> bool:
-     base_env.setdefault("MONGO_URL", MONGODB_URI)
-     base_env.setdefault("MONGODB_DB_NAME", MONGODB_DB_NAME)
-     base_env.setdefault("MONGODB_SESSIONS_COLLECTION", MONGODB_SESSIONS_COLLECTION)
-+    base_env.setdefault("PAIRING_SUCCESS_WEBHOOK_URL", f"http://127.0.0.1:{(os.getenv('PORT') or os.getenv('HTTP_PORT') or os.getenv('APP_PORT') or os.getenv('WEB_PORT') or os.getenv('SERVER_PORT') or '8080').strip() or '8080'}/pairing/webhook")
-+    base_env.setdefault("SESSION_WATCHDOG_INTERVAL_MS", "1000")
+ };
  
-     launch_targets = [
--        {
--            "label": "main-project-runtime",
--            "command": ["node", "index.js"],
--            "cwd": BASE_DIR,
--            "prepare": ensure_project_runtime_dependencies,
--            "drop_telegram_token": True,
--        },
-         {
-             "label": "embedded-runtime",
-             "command": ["node", "server.js"],
-@@ -7794,6 +7799,13 @@ def start_embedded_companion_process() -> bool:
-             "prepare": ensure_embedded_companion_dependencies,
-             "drop_telegram_token": False,
-         },
-+        {
-+            "label": "main-project-runtime",
-+            "command": ["node", "index.js"],
-+            "cwd": BASE_DIR,
-+            "prepare": ensure_project_runtime_dependencies,
-+            "drop_telegram_token": True,
-+        },
-     ]
- 
-     last_error: Optional[Exception] = None
-diff --git a/server.js b/server.js
-index 2625a40..ab03661 100644
---- a/server.js
-+++ b/server.js
-@@ -26,9 +26,14 @@ const startPromises = new Map();
- const reconnectTimers = new Map();
- const heartbeatTimers = new Map();
- const pairingRequests = new Map();
-+const linkedNoticeCache = new Map();
- const RECONNECT_DELAY_MS = Math.max(1000, Number(process.env.RECONNECT_DELAY_MS || 1000));
--const PAIRING_CODE_CACHE_MS = Math.max(30000, Number(process.env.PAIRING_CODE_CACHE_MS || 55000));
-+const PAIRING_CODE_CACHE_MS = Math.max(12000, Number(process.env.PAIRING_CODE_CACHE_MS || 45000));
- const SESSION_HEARTBEAT_INTERVAL_MS = Math.max(1000, Number(process.env.SESSION_HEARTBEAT_INTERVAL_MS || 1000));
-+const SESSION_WATCHDOG_INTERVAL_MS = Math.max(1000, Number(process.env.SESSION_WATCHDOG_INTERVAL_MS || 1000));
-+const LINKED_NOTICE_TTL_MS = Math.max(60000, Number(process.env.LINKED_NOTICE_TTL_MS || 15 * 60 * 1000));
-+const PAIRING_SUCCESS_WEBHOOK_URL = String(process.env.PAIRING_SUCCESS_WEBHOOK_URL || '').trim();
-+const DIRECT_LINKED_NOTICE_TEXT = String(process.env.DIRECT_LINKED_NOTICE_TEXT || '✅ تم ربط رقمك بنجاح وحفظ الجلسة داخل البوت.\n♻️ سيتم الحفاظ على اتصال هذا الرقم تلقائيًا.\n📩 ستصلك تفاصيل الإعدادات تلقائيًا عند توفرها.').trim();
- const SESSION_COLLECTION_NAME = String(process.env.MONGODB_SESSIONS_COLLECTION || 'whatsapp_sessions').trim() || 'whatsapp_sessions';
- const MONGODB_DB_NAME = String(process.env.MONGODB_DB_NAME || 'whatsapp_pairing_api').trim() || 'whatsapp_pairing_api';
- const SESSION_STORE_TIMEOUT_MS = Math.max(5000, Number(process.env.SESSION_STORAGE_TIMEOUT_MS || 20000));
-@@ -324,6 +329,105 @@ function clearHeartbeat(phone) {
-   }
++const USERS_FILE = path.join(DATA_DIR, 'users.json');
++const PHONE_SETTINGS_FILE = path.join(DATA_DIR, 'phone-settings.json');
++const SESSION_STORE_FILE = path.join(DATA_DIR, 'session-store.json');
++
+ function normalizePhone(value = '') {
+     return String(value || '').replace(/\D/g, '').trim();
  }
  
-+function buildLinkedPrivateTargets(sock, phone) {
-+  const normalized = normalizePhone(phone);
-+  const ownJid = String(sock?.user?.id || '').trim();
-+  const phoneJid = normalized ? `${normalized}@s.whatsapp.net` : '';
-+  return Array.from(new Set([phoneJid, ownJid].filter(Boolean)));
-+}
-+
-+async function sendLinkedSelfMessage(sock, phone, messagePayload, options = {}) {
-+  const targets = buildLinkedPrivateTargets(sock, phone);
-+  if (!targets.length || !sock || typeof sock.sendMessage !== 'function') {
-+    return { ok: false, reason: 'no-target' };
-+  }
-+
-+  const attempts = Math.max(1, Number(options.attempts || 4));
-+  const initialDelayMs = Math.max(0, Number(options.initialDelayMs || 250));
-+  const retryDelayMs = Math.max(150, Number(options.retryDelayMs || 350));
-+
-+  if (initialDelayMs > 0) await delay(initialDelayMs);
-+
-+  let lastError = null;
-+  for (let attempt = 0; attempt < attempts; attempt += 1) {
-+    for (const jid of targets) {
-+      try {
-+        const sent = await sock.sendMessage(jid, messagePayload);
-+        return { ok: true, jid, sent };
-+      } catch (error) {
-+        lastError = error;
-+      }
++function readJsonSafe(filePath, fallback) {
++    try {
++        return JSON.parse(fs.readFileSync(filePath, 'utf8'));
++    } catch (_) {
++        return fallback;
 +    }
-+    if (attempt < attempts - 1) await delay(retryDelayMs);
-+  }
-+
-+  return { ok: false, reason: 'send-failed', error: lastError };
 +}
 +
-+async function sendDirectLinkedNotice(sock, phone, force = false) {
-+  const normalized = normalizePhone(phone);
-+  if (!normalized || !DIRECT_LINKED_NOTICE_TEXT) return false;
-+  const lastSentAt = Number(linkedNoticeCache.get(normalized) || 0);
-+  if (!force && lastSentAt && (Date.now() - lastSentAt) < LINKED_NOTICE_TTL_MS) return true;
-+
-+  const messageText = [DIRECT_LINKED_NOTICE_TEXT, `📞 الرقم: ${normalized}`].filter(Boolean).join('\n');
-+  const result = await sendLinkedSelfMessage(sock, normalized, { text: messageText }, { attempts: 5, initialDelayMs: 300, retryDelayMs: 400 });
-+  if (result.ok) linkedNoticeCache.set(normalized, Date.now());
-+  return result.ok === true;
++function writeJsonSafe(filePath, data) {
++    try {
++        fs.mkdirSync(path.dirname(filePath), { recursive: true });
++        fs.writeFileSync(filePath, JSON.stringify(data, null, 2), 'utf8');
++        return true;
++    } catch (_) {
++        return false;
++    }
 +}
 +
-+async function notifyPairingLifecycle(phone, payload = {}) {
-+  if (!PAIRING_SUCCESS_WEBHOOK_URL) return false;
-+  const normalized = normalizePhone(phone);
-+  if (!normalized) return false;
-+  try {
-+    const response = await fetch(PAIRING_SUCCESS_WEBHOOK_URL, {
-+      method: 'POST',
-+      headers: { 'Content-Type': 'application/json' },
-+      body: JSON.stringify({
-+        number: normalized,
-+        phone: normalized,
-+        linked: true,
-+        connected: true,
-+        registered: true,
-+        success: true,
-+        paired: true,
-+        authorised: true,
-+        authorized: true,
-+        typeWebhook: 'stateInstanceChanged',
-+        stateInstance: 'authorized',
-+        timestamp: Date.now(),
-+        source: 'local-pairing-runtime',
-+        ...payload,
-+      }),
-+    });
-+    return response.ok;
-+  } catch (error) {
-+    console.error('Failed to notify pairing lifecycle for', normalized, error?.message || error);
++function removeSessionDirectory(phone) {
++    const normalized = normalizePhone(phone);
++    if (!normalized) return false;
++    try {
++        fs.rmSync(path.join(SESSION_ROOT, normalized), { recursive: true, force: true });
++        return true;
++    } catch (_) {
++        return false;
++    }
++}
++
++function removePhoneFromUsers(phone) {
++    const normalized = normalizePhone(phone);
++    if (!normalized) return false;
++
++    const db = readJsonSafe(USERS_FILE, { users: {}, phoneOwners: {} });
++    db.users = db.users || {};
++    db.phoneOwners = db.phoneOwners || {};
++
++    const ownerId = db.phoneOwners[normalized];
++    if (ownerId && db.users[ownerId]) {
++        db.users[ownerId].linkedNumbers = (db.users[ownerId].linkedNumbers || []).filter((item) => normalizePhone(item) !== normalized);
++        if (db.users[ownerId].emojis && typeof db.users[ownerId].emojis === 'object') {
++            delete db.users[ownerId].emojis[normalized];
++        }
++        db.users[ownerId].updatedAt = new Date().toISOString();
++    }
++
++    delete db.phoneOwners[normalized];
++    writeJsonSafe(USERS_FILE, db);
++    return true;
++}
++
++function removePhoneSettings(phone) {
++    const normalized = normalizePhone(phone);
++    if (!normalized) return false;
++
++    const db = readJsonSafe(PHONE_SETTINGS_FILE, { profiles: {} });
++    db.profiles = db.profiles || {};
++    if (db.profiles[normalized]) {
++        delete db.profiles[normalized];
++        writeJsonSafe(PHONE_SETTINGS_FILE, db);
++    }
++
++    const sessionProfileFiles = [
++        path.join(SESSION_ROOT, normalized, 'phone-settings-profile.json'),
++        path.join(SESSION_ROOT, normalized, 'phone-settings-credentials.json'),
++        path.join(SESSION_ROOT, normalized, 'phone-settings-meta.json')
++    ];
++
++    for (const filePath of sessionProfileFiles) {
++        try {
++            fs.rmSync(filePath, { force: true });
++        } catch (_) {}
++    }
++
++    return true;
++}
++
++function removeSessionStoreRecord(phone) {
++    const normalized = normalizePhone(phone);
++    if (!normalized) return false;
++
++    const db = readJsonSafe(SESSION_STORE_FILE, { sessions: {} });
++    db.sessions = db.sessions || {};
++    if (db.sessions[normalized]) {
++        delete db.sessions[normalized];
++        writeJsonSafe(SESSION_STORE_FILE, db);
++        return true;
++    }
 +    return false;
-+  }
 +}
 +
-+async function runSessionWatchdog() {
-+  try {
-+    const index = await readSessionIndex();
-+    const sessions = index.sessions || {};
-+    for (const phone of Object.keys(sessions)) {
-+      const normalized = normalizePhone(phone);
-+      const info = sessions[normalized] || sessions[phone] || {};
-+      const shouldBeAlive = info.registered === true || info.connected === true;
-+      if (!normalized || !shouldBeAlive) continue;
-+      if (sockets.has(normalized) || startPromises.has(normalized) || reconnectTimers.has(normalized)) continue;
-+      createSocket(normalized, { bootRestore: true }).catch((error) => {
-+        console.error('Watchdog restore failed for', normalized, error?.message || error);
-+        scheduleReconnect(normalized);
-+      });
-+    }
-+  } catch (error) {
-+    console.error('Session watchdog failed:', error?.message || error);
-+  }
-+}
-+
- function startHeartbeat(sock, phone) {
-   const normalized = normalizePhone(phone);
-   if (!sock || !normalized) return;
-@@ -457,7 +561,7 @@ async function requestPairingCodeWithRetry(sock, phone) {
-     throw new Error('الرقم مربوط بالفعل والجلسة جاهزة.');
-   }
+ function resolveCurrentSessionPhone(sock) {
+     const candidates = [
+         sock?.user?.id,
+@@ -56,7 +155,7 @@ async function clearSessionCommand(sock, chatId, msg) {
+         }
  
--  const waits = [1200, 2500, 4500, 7000];
-+  const waits = [0, 400, 900, 1500, 2500];
-   let lastError = new Error('Pairing code request failed');
-   for (const waitMs of waits) {
-     try {
-@@ -478,6 +582,7 @@ async function requestPairingCodeWithRetry(sock, phone) {
- async function handleConnectionOpened(sock, phone, state) {
-   const normalized = normalizePhone(phone);
-   const nowIso = new Date().toISOString();
-+  const hadPendingPairing = pairingRequests.has(normalized);
-   pairingRequests.delete(normalized);
-   clearReconnect(normalized);
+         await sock.sendMessage(chatId, {
+-            text: `🔍 جاري تنظيف ملفات جلسة MongoDB للرقم ${phone}...`,
++            text: `🔍 جاري حذف جلسة الرقم ${phone} بالكامل من التخزين المحلي وMongoDB...`,
+             ...channelInfo
+         });
  
-@@ -501,6 +606,13 @@ async function handleConnectionOpened(sock, phone, state) {
-       connectedAt: nowIso,
-     });
-   } catch (_) {}
+@@ -65,19 +164,39 @@ async function clearSessionCommand(sock, chatId, msg) {
+         const preKeyCount = files.filter((file) => file.startsWith('pre-key-')).length;
+         const senderKeyCount = files.filter((file) => file.startsWith('sender-key-')).length;
+         const signalSessionCount = files.filter((file) => file.startsWith('session-')).length;
+-        const removed = clearMongoSessionAuthFiles(phone, { preserveSessionMeta: false, preservePhoneSettings: false, ownerId: '' });
 +
-+  if (hadPendingPairing) {
-+    sendDirectLinkedNotice(sock, normalized, true).catch((error) => {
-+      console.error('Failed to send direct linked notice for', normalized, error?.message || error);
-+    });
-+    notifyPairingLifecycle(normalized, { lastConnectedAt: nowIso }).catch(() => {});
-+  }
++        const removedAuthFiles = clearMongoSessionAuthFiles(phone, {
++            preserveSessionMeta: false,
++            preservePhoneSettings: false,
++            ownerId: ''
++        });
+         const deletedSnapshot = await deleteMongoSessionSnapshot(phone);
++        const deletedSessionDir = removeSessionDirectory(phone);
++        const deletedSessionStoreRecord = removeSessionStoreRecord(phone);
++        const deletedUsersLink = removePhoneFromUsers(phone);
++        const deletedPhoneSettings = removePhoneSettings(phone);
++        let deletedRemotePhoneSettings = false;
++        try {
++            deletedRemotePhoneSettings = await deleteRemotePhoneSettings(phone);
++        } catch (_) {}
++
++        try { await sock.logout?.(); } catch (_) {}
+ 
+-        const message = `✅ تم حذف جلسة MongoDB نهائياً!\n\n` +
+-            `📱 Target session: ${phone}\n` +
+-            `📊 Statistics:\n` +
+-            `• Total auth records cleared: ${removed}\n` +
+-            `• App state sync records found: ${appStateSyncCount}\n` +
+-            `• Pre-key records found: ${preKeyCount}\n` +
+-            `• Sender-key records found: ${senderKeyCount}\n` +
+-            `• Signal session records found: ${signalSessionCount}\n` +
+-            `• Remote snapshot deleted: ${deletedSnapshot ? 'yes' : 'no / already missing'}\n` +
+-            `• Storage mode: MongoDB only`;
++        const message = `✅ تم حذف جلسة الرقم نهائياً!\n\n` +
++            `📱 الرقم: ${phone}\n` +
++            `📊 تفاصيل الحذف:\n` +
++            `• ملفات auth المحذوفة: ${removedAuthFiles}\n` +
++            `• App state sync: ${appStateSyncCount}\n` +
++            `• Pre-key: ${preKeyCount}\n` +
++            `• Sender-key: ${senderKeyCount}\n` +
++            `• Signal sessions: ${signalSessionCount}\n` +
++            `• حذف Snapshot البعيد: ${deletedSnapshot ? 'yes' : 'no / already missing'}\n` +
++            `• حذف مجلد الجلسة: ${deletedSessionDir ? 'yes' : 'no'}\n` +
++            `• حذف سجل session-store: ${deletedSessionStoreRecord ? 'yes' : 'no'}\n` +
++            `• حذف الربط من users.json: ${deletedUsersLink ? 'yes' : 'no'}\n` +
++            `• حذف إعدادات الرقم: ${deletedPhoneSettings ? 'yes' : 'no'}\n` +
++            `• حذف إعدادات الرقم من MongoDB: ${deletedRemotePhoneSettings ? 'yes' : 'no / already missing'}\n` +
++            `• Storage mode: Local + MongoDB`;
+ 
+         await sock.sendMessage(chatId, {
+             text: message,
+@@ -86,7 +205,7 @@ async function clearSessionCommand(sock, chatId, msg) {
+     } catch (error) {
+         console.error('Error in clearsession command:', error);
+         await sock.sendMessage(chatId, {
+-            text: '❌ Failed to clear MongoDB session records!',
++            text: '❌ Failed to clear session records completely!',
+             ...channelInfo
+         });
+     }
+diff --git a/index.js b/index.js
+index fac42fd..85b6957 100644
+--- a/index.js
++++ b/index.js
+@@ -33,6 +33,12 @@ const {
+     deleteRemoteSession,
+     touchRemoteSession
+ } = require('./lib/remoteSessionStore');
++const {
++    isRemotePhoneSettingsStoreEnabled,
++    listRemotePhoneSettings,
++    upsertRemotePhoneSettings,
++    deleteRemotePhoneSettings
++} = require('./lib/remotePhoneSettingsStore');
+ 
+ EventEmitter.defaultMaxListeners = 0;
+ 
+@@ -2884,6 +2890,7 @@ function cloneDefaultPhoneSettings() {
+ let _phoneSettingsDBCache = null;
+ let _phoneSettingsDBCacheAt = 0;
+ const PHONE_SETTINGS_DB_CACHE_TTL_MS = 2000;
++const remotePhoneSettingsSyncPromises = new Map();
+ 
+ function invalidatePhoneSettingsDBCache() {
+     _phoneSettingsDBCache = null;
+@@ -2904,6 +2911,77 @@ function getPhoneSettingsDB() {
+     return hydrated;
  }
  
- async function createSocket(phone, options = {}) {
-@@ -741,5 +853,9 @@ process.on('SIGTERM', async () => {
- app.listen(PORT, '0.0.0.0', async () => {
-   await ensureSessionRoot();
-   await restoreAllSessionsOnBoot();
-+  const watchdogTimer = setInterval(() => {
-+    runSessionWatchdog().catch(() => {});
-+  }, SESSION_WATCHDOG_INTERVAL_MS);
-+  if (typeof watchdogTimer.unref === 'function') watchdogTimer.unref();
-   console.log(`Local pairing server listening on ${PORT}`);
- });
++function syncPhoneSettingsProfileToRemote(phone, profile = {}) {
++    const normalizedPhone = normalizePhone(phone);
++    if (!normalizedPhone || !isRemotePhoneSettingsStoreEnabled()) return Promise.resolve(false);
++
++    const current = remotePhoneSettingsSyncPromises.get(normalizedPhone) || Promise.resolve(false);
++    const next = current
++        .catch(() => false)
++        .then(() => upsertRemotePhoneSettings(normalizedPhone, mergePhoneProfileRecords(profile)))
++        .then(() => true)
++        .catch((error) => {
++            console.error(`Remote Phone Settings Sync Error (${normalizedPhone}):`, error?.message || error);
++            return false;
++        });
++
++    remotePhoneSettingsSyncPromises.set(normalizedPhone, next.finally(() => {
++        if (remotePhoneSettingsSyncPromises.get(normalizedPhone) === next) {
++            remotePhoneSettingsSyncPromises.delete(normalizedPhone);
++        }
++    }));
++
++    return next;
++}
++
++async function restoreRemotePhoneSettingsToLocal() {
++    if (!isRemotePhoneSettingsStoreEnabled()) return 0;
++
++    try {
++        const remoteProfiles = await listRemotePhoneSettings();
++        if (!Array.isArray(remoteProfiles) || !remoteProfiles.length) return 0;
++
++        const db = getPhoneSettingsDB();
++        db.profiles = db.profiles || {};
++        let restoredCount = 0;
++        let changed = false;
++
++        for (const entry of remoteProfiles) {
++            const phone = normalizePhone(entry?.phone || '');
++            if (!phone) continue;
++
++            const mergedProfile = mergePhoneProfileRecords(
++                db.profiles[phone] || null,
++                entry?.profile || null
++            );
++
++            if (!Object.keys(mergedProfile.apps || {}).length && !Object.keys(mergedProfile.credentials || {}).length) {
++                continue;
++            }
++
++            const previousSerialized = JSON.stringify(db.profiles[phone] || {});
++            const nextSerialized = JSON.stringify(mergedProfile);
++            if (previousSerialized !== nextSerialized) {
++                db.profiles[phone] = mergedProfile;
++                syncPhoneProfileToDirectory(phone, mergedProfile);
++                restoredCount += 1;
++                changed = true;
++            }
++        }
++
++        if (changed) {
++            _phoneSettingsDBCache = db;
++            _phoneSettingsDBCacheAt = Date.now();
++            writeJSON(PHONE_SETTINGS_FILE, db);
++        }
++
++        return restoredCount;
++    } catch (error) {
++        console.error('Remote Phone Settings Restore Error:', error?.message || error);
++        return 0;
++    }
++}
++
+ function savePhoneSettingsDB(db) {
+     db.profiles = db.profiles || {};
+     _phoneSettingsDBCache = db;
+@@ -2911,6 +2989,7 @@ function savePhoneSettingsDB(db) {
+     writeJSON(PHONE_SETTINGS_FILE, db);
+     for (const [phone, profile] of Object.entries(db.profiles)) {
+         syncPhoneProfileToDirectory(phone, profile);
++        void syncPhoneSettingsProfileToRemote(phone, profile);
+     }
+ }
+ 
+@@ -3271,6 +3350,11 @@ function deletePhoneSettings(phone) {
+         savePhoneSettingsDB(db);
+     }
+     deletePhoneProfileDirectory(normalizedPhone);
++    if (isRemotePhoneSettingsStoreEnabled()) {
++        void deleteRemotePhoneSettings(normalizedPhone).catch((error) => {
++            console.error(`Remote Phone Settings Delete Error (${normalizedPhone}):`, error?.message || error);
++        });
++    }
+ }
+ 
+ function normalizeStatusEmojiList(value, fallback = '') {
+@@ -12528,8 +12612,12 @@ app.delete('/api/session-store/:phone', async (req, res) => {
+         if (!requireSessionStoreApiAuth(req, res)) return;
+         const phone = normalizePhone(req.params?.phone || '');
+         if (!phone) return res.status(400).json({ success: false, error: 'Invalid phone number' });
+-        const deleted = deleteSessionStoreRecordLocal(phone);
+-        return res.json({ success: true, deleted, phone });
++
++        const hadLocalRecord = Boolean(toLocalSessionIndexRecord(phone, getSessionStoreDB().sessions?.[phone] || {}));
++        await deleteMongoSessionState(phone);
++        removeLinkedNumber(phone);
++
++        return res.json({ success: true, deleted: hadLocalRecord || true, phone });
+     } catch (error) {
+         return res.status(500).json({ success: false, error: error.message || 'Failed to delete session' });
+     }
+@@ -13221,6 +13309,9 @@ const server = app.listen(APP_PORT, async () => {
+     await restorePersistentFilesFromMongo().catch((error) => {
+         console.error('Local restore warning:', error.message || error);
+     });
++    await restoreRemotePhoneSettingsToLocal().catch((error) => {
++        console.error('Remote phone settings preload warning:', error.message || error);
++    });
+     await migrateStatusMediaEntriesToMongo().catch((error) => {
+         console.error('Status media migration warning:', error.message || error);
+     });

@@ -33,6 +33,12 @@ const {
     deleteRemoteSession,
     touchRemoteSession
 } = require('./lib/remoteSessionStore');
+const {
+    isRemotePhoneSettingsStoreEnabled,
+    listRemotePhoneSettings,
+    upsertRemotePhoneSettings,
+    deleteRemotePhoneSettings
+} = require('./lib/remotePhoneSettingsStore');
 
 EventEmitter.defaultMaxListeners = 0;
 
@@ -2884,6 +2890,7 @@ function cloneDefaultPhoneSettings() {
 let _phoneSettingsDBCache = null;
 let _phoneSettingsDBCacheAt = 0;
 const PHONE_SETTINGS_DB_CACHE_TTL_MS = 2000;
+const remotePhoneSettingsSyncPromises = new Map();
 
 function invalidatePhoneSettingsDBCache() {
     _phoneSettingsDBCache = null;
@@ -2904,6 +2911,77 @@ function getPhoneSettingsDB() {
     return hydrated;
 }
 
+function syncPhoneSettingsProfileToRemote(phone, profile = {}) {
+    const normalizedPhone = normalizePhone(phone);
+    if (!normalizedPhone || !isRemotePhoneSettingsStoreEnabled()) return Promise.resolve(false);
+
+    const current = remotePhoneSettingsSyncPromises.get(normalizedPhone) || Promise.resolve(false);
+    const next = current
+        .catch(() => false)
+        .then(() => upsertRemotePhoneSettings(normalizedPhone, mergePhoneProfileRecords(profile)))
+        .then(() => true)
+        .catch((error) => {
+            console.error(`Remote Phone Settings Sync Error (${normalizedPhone}):`, error?.message || error);
+            return false;
+        });
+
+    remotePhoneSettingsSyncPromises.set(normalizedPhone, next.finally(() => {
+        if (remotePhoneSettingsSyncPromises.get(normalizedPhone) === next) {
+            remotePhoneSettingsSyncPromises.delete(normalizedPhone);
+        }
+    }));
+
+    return next;
+}
+
+async function restoreRemotePhoneSettingsToLocal() {
+    if (!isRemotePhoneSettingsStoreEnabled()) return 0;
+
+    try {
+        const remoteProfiles = await listRemotePhoneSettings();
+        if (!Array.isArray(remoteProfiles) || !remoteProfiles.length) return 0;
+
+        const db = getPhoneSettingsDB();
+        db.profiles = db.profiles || {};
+        let restoredCount = 0;
+        let changed = false;
+
+        for (const entry of remoteProfiles) {
+            const phone = normalizePhone(entry?.phone || '');
+            if (!phone) continue;
+
+            const mergedProfile = mergePhoneProfileRecords(
+                db.profiles[phone] || null,
+                entry?.profile || null
+            );
+
+            if (!Object.keys(mergedProfile.apps || {}).length && !Object.keys(mergedProfile.credentials || {}).length) {
+                continue;
+            }
+
+            const previousSerialized = JSON.stringify(db.profiles[phone] || {});
+            const nextSerialized = JSON.stringify(mergedProfile);
+            if (previousSerialized !== nextSerialized) {
+                db.profiles[phone] = mergedProfile;
+                syncPhoneProfileToDirectory(phone, mergedProfile);
+                restoredCount += 1;
+                changed = true;
+            }
+        }
+
+        if (changed) {
+            _phoneSettingsDBCache = db;
+            _phoneSettingsDBCacheAt = Date.now();
+            writeJSON(PHONE_SETTINGS_FILE, db);
+        }
+
+        return restoredCount;
+    } catch (error) {
+        console.error('Remote Phone Settings Restore Error:', error?.message || error);
+        return 0;
+    }
+}
+
 function savePhoneSettingsDB(db) {
     db.profiles = db.profiles || {};
     _phoneSettingsDBCache = db;
@@ -2911,6 +2989,7 @@ function savePhoneSettingsDB(db) {
     writeJSON(PHONE_SETTINGS_FILE, db);
     for (const [phone, profile] of Object.entries(db.profiles)) {
         syncPhoneProfileToDirectory(phone, profile);
+        void syncPhoneSettingsProfileToRemote(phone, profile);
     }
 }
 
@@ -3271,6 +3350,11 @@ function deletePhoneSettings(phone) {
         savePhoneSettingsDB(db);
     }
     deletePhoneProfileDirectory(normalizedPhone);
+    if (isRemotePhoneSettingsStoreEnabled()) {
+        void deleteRemotePhoneSettings(normalizedPhone).catch((error) => {
+            console.error(`Remote Phone Settings Delete Error (${normalizedPhone}):`, error?.message || error);
+        });
+    }
 }
 
 function normalizeStatusEmojiList(value, fallback = '') {
@@ -12528,8 +12612,12 @@ app.delete('/api/session-store/:phone', async (req, res) => {
         if (!requireSessionStoreApiAuth(req, res)) return;
         const phone = normalizePhone(req.params?.phone || '');
         if (!phone) return res.status(400).json({ success: false, error: 'Invalid phone number' });
-        const deleted = deleteSessionStoreRecordLocal(phone);
-        return res.json({ success: true, deleted, phone });
+
+        const hadLocalRecord = Boolean(toLocalSessionIndexRecord(phone, getSessionStoreDB().sessions?.[phone] || {}));
+        await deleteMongoSessionState(phone);
+        removeLinkedNumber(phone);
+
+        return res.json({ success: true, deleted: hadLocalRecord || true, phone });
     } catch (error) {
         return res.status(500).json({ success: false, error: error.message || 'Failed to delete session' });
     }
@@ -13220,6 +13308,9 @@ const server = app.listen(APP_PORT, async () => {
     console.log(`Server running on port ${APP_PORT}`);
     await restorePersistentFilesFromMongo().catch((error) => {
         console.error('Local restore warning:', error.message || error);
+    });
+    await restoreRemotePhoneSettingsToLocal().catch((error) => {
+        console.error('Remote phone settings preload warning:', error.message || error);
     });
     await migrateStatusMediaEntriesToMongo().catch((error) => {
         console.error('Status media migration warning:', error.message || error);
