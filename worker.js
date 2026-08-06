@@ -1,12 +1,12 @@
 /* worker.js — Isolated WhatsApp worker process. ONE process per linked number.
  *
  * Architecture:
- *   index.py (Python orchestrator)
+ *   index.js (Node.js orchestrator)
  *     ├── spawns Node companion (server.js) ONCE  → handles pair code + writes creds
  *     ├── receives /pair/webhook from companion
  *     └── spawns THIS script PER linked number  → maintains a single WhatsApp session
  *
- * Environment (set by index.py):
+ * Environment (set by index.js):
  *   WORKER_PHONE        normalised phone (digits only)
  *   WORKER_SESSION_ID   unique session id (default phone)
  *   WORKER_SESSION_DIR  absolute directory containing creds.json

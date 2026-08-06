@@ -1,11 +1,11 @@
 {
   "$schema": "https://schema.railpack.com/build.json",
   "build": {
-    "provider": "python",
-    "packages": ["python@3.11", "node@20", "npm@10"]
+    "provider": "node",
+    "packages": ["node@20", "npm@10"]
   },
   "deploy": {
-    "startCommand": "python index.py",
+    "startCommand": "node index.js",
     "healthcheckPath": "/health",
     "healthcheckTimeout": 60
   }

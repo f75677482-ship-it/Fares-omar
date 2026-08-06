@@ -1,12 +1,11 @@
 [phases.setup]
 apt_pkgs = ["nodejs", "npm"]
-nix_pkgs = ["nodejs_20", "python311"]
+nix_pkgs = ["nodejs_20"]
 
 [phases.install]
 cmds = [
-  "pip install --quiet -r requirements.txt",
   "npm install --omit=dev --legacy-peer-deps --no-audit --no-fund",
 ]
 
 [start]
-cmd = "python index.py"
+cmd = "node index.js"

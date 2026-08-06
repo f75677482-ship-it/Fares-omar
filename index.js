@@ -13212,7 +13212,7 @@ async function gracefulShutdown(signal) {
     pairingRequests.clear();
 
     try {
-        await flushAllSessionSnapshotSync();
+        await flushAllSessionSnapshotSyncs();
     } catch (error) {
         console.error('Session Flush Warning:', error.message || error);
     }
