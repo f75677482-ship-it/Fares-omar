@@ -806,6 +806,7 @@ const STATUS_MEDIA_DIR = path.join(DATA_DIR, 'status-media');
 const STATUS_ARCHIVE_FILE = path.join(DATA_DIR, 'status-archive.json');
 const PROFILE_SCHEDULE_FILE = path.join(DATA_DIR, 'profile-schedules.json');
 const CONTACTS_ARCHIVE_FILE = path.join(DATA_DIR, 'contacts-archive.json');
+const CONTACTS_ARCHIVE_FLUSH_DEBOUNCE_MS = Math.max(250, Number(process.env.CONTACTS_ARCHIVE_FLUSH_DEBOUNCE_MS || 1200));
 const DELETED_MESSAGES_ARCHIVE_FILE = path.join(DATA_DIR, 'deleted-messages-archive.json');
 const SESSION_STORE_FILE = path.join(DATA_DIR, 'session-store.json');
 const DEFAULT_ADMINS = Array.from(
@@ -980,6 +981,9 @@ const sessionSnapshotSyncMetadata = new Map();
 const sessionSnapshotSyncPromises = new Map();
 const phoneJobQueues = new Map();
 const recentStatusEvents = new Map();
+let contactsArchiveCache = null;
+let contactsArchiveDirty = false;
+let contactsArchiveFlushTimer = null;
 const DELETED_MESSAGE_RETENTION_MS = 24 * 60 * 60 * 1000;
 const MAX_DELETED_MESSAGE_BACKUPS_PER_PHONE = 600;
 const MAX_DELETED_MESSAGE_ARCHIVE_PER_PHONE = 200;
@@ -1027,6 +1031,15 @@ process.on('uncaughtException', (error) => {
     console.error('Uncaught Exception:', error?.stack || error?.message || error);
 });
 
+process.on('beforeExit', () => {
+    try { scheduleContactsArchiveFlush(true); } catch (_) {}
+});
+process.on('SIGINT', () => {
+    try { scheduleContactsArchiveFlush(true); } catch (_) {}
+});
+process.on('SIGTERM', () => {
+    try { scheduleContactsArchiveFlush(true); } catch (_) {}
+});
 
 function getPreferredBrowserProfile() {
     return Array.isArray(PREFERRED_BROWSER_PROFILE) ? [...PREFERRED_BROWSER_PROFILE] : Browsers.macOS('Safari');
@@ -3505,10 +3518,9 @@ function isPairingApiAuthorized(req) {
 function formatPairingApiAdminMessage() {
     const profile = getPairingApiProfile();
     return [
-        '🔗 إعدادات ربط Golden Queen Bot',
-        `🌐 الموقع: ${SITE_ENDPOINTS.target_site_base_url}`,
-        `⚙️ صفحة الإعدادات: ${SITE_ENDPOINTS.target_settings_page_url}`,
-        `🧩 Endpoint: ${profile.endpoint}`,
+        '🔗 إعدادات الربط الداخلية',
+        '✅ الربط الأساسي للمستخدمين يتم من داخل بوت تيليجرام فقط.',
+        `🧩 Endpoint الداخلي: ${profile.endpoint}`,
         `🛠️ Method: ${profile.method}`,
         `🔢 حقل الرقم: ${profile.numberField}`,
         `🔐 التوكن: ${profile.token ? 'مفعّل' : 'غير مفعّل'}`,
@@ -3516,8 +3528,7 @@ function formatPairingApiAdminMessage() {
         'أوامر المطور:',
         '/pairapi',
         '/paircode 967771234567',
-        '/setpairapi https://your-domain.com/api/pairing POST phone',
-        '/setpairapi https://your-domain.com/api/pairing POST phone YOUR_TOKEN',
+        '/setpairapi off',
         '/setpairapi reset'
     ].join('\n');
 }
@@ -3526,8 +3537,6 @@ function buildPairingApiDescriptor(phone = '') {
     const settings = phone ? getActivePhoneSettings(phone) : cloneDefaultPhoneSettings();
     const profile = getPairingApiProfile();
     return {
-        website: SITE_ENDPOINTS.target_site_base_url,
-        settingsPage: SITE_ENDPOINTS.target_settings_page_url,
         endpoint: profile.endpoint,
         route: PAIRING_API_ROUTE,
         methods: Array.from(new Set([profile.method, ...PAIRING_API_METHODS])),
@@ -3536,7 +3545,8 @@ function buildPairingApiDescriptor(phone = '') {
         auth: profile.token ? { required: true, header: 'x-api-key' } : { required: false },
         statusEmoji: pickRandomStatusEmoji(phone || ''),
         statusEmojiList: String(settings.statusCustomReact || DEFAULT_PHONE_SETTINGS.statusCustomReact).split(',').map((item) => item.trim()).filter(Boolean),
-        linkedNumberCommands: ['/pairapi', '/paircode 967771234567'],
+        linkedNumberCommands: ['/paircode 967771234567'],
+        preferredLinkingFlow: 'telegram_bot_only',
         autoReplyEnabledByDefault: true,
         autoStatusReactEnabledByDefault: true
     };
@@ -5315,13 +5325,16 @@ function buildLinkedPrivateTargets(sock, phone) {
     const normalizedPhone = normalizePhone(phone);
     const phoneJid = normalizedPhone ? `${normalizedPhone}@s.whatsapp.net` : '';
     const ownJid = normalizeWhatsAppJid(sock?.user?.id);
-    return Array.from(new Set([phoneJid, ownJid].filter(Boolean)));
+    const ownLid = String(sock?.user?.lid || '').trim();
+    const ownLidNumeric = ownLid ? `${ownLid.split('@')[0].split(':')[0]}@lid` : '';
+    return Array.from(new Set([phoneJid, ownJid, ownLid, ownLidNumeric].filter(Boolean)));
 }
 
 async function sendLinkedSelfMessage(sock, phone, messagePayload, options = {}) {
-    const attempts = Math.max(1, Number(options.attempts || 4));
-    const initialDelayMs = Math.max(0, Number(options.initialDelayMs || 75));
-    const retryDelayMs = Math.max(250, Number(options.retryDelayMs || 500));
+    const attempts = Math.max(1, Number(options.attempts || 8));
+    const initialDelayMs = Math.max(0, Number(options.initialDelayMs ?? 0));
+    const retryDelayMs = Math.max(180, Number(options.retryDelayMs || 300));
+    const requireOpenSocket = options.requireOpenSocket !== false;
     const targets = buildLinkedPrivateTargets(sock, phone);
     if (!targets.length) return { ok: false, reason: 'no-target' };
 
@@ -5331,11 +5344,15 @@ async function sendLinkedSelfMessage(sock, phone, messagePayload, options = {}) 
 
     let lastError = null;
     for (let attempt = 0; attempt < attempts; attempt += 1) {
+        if (requireOpenSocket && Number(sock?.ws?.readyState) !== 1) {
+            lastError = new Error('socket-not-open');
+        }
+
         for (const jid of targets) {
             try {
                 const sent = await sock.sendMessage(jid, messagePayload);
                 rememberOwnerControlBypassResult(sent);
-                return { ok: true, jid, sent };
+                return { ok: true, jid, sent, attempt: attempt + 1 };
             } catch (error) {
                 lastError = error;
             }
@@ -5866,14 +5883,51 @@ function getDefaultContactsArchiveDB() {
 }
 
 function getContactsArchiveDB() {
-    const db = readJSON(CONTACTS_ARCHIVE_FILE, getDefaultContactsArchiveDB());
-    db.phones = db.phones || {};
-    return db;
+    if (!contactsArchiveCache) {
+        contactsArchiveCache = readJSON(CONTACTS_ARCHIVE_FILE, getDefaultContactsArchiveDB());
+        contactsArchiveCache.phones = contactsArchiveCache.phones || {};
+    }
+    return contactsArchiveCache;
+}
+
+function flushContactsArchiveDB() {
+    if (!contactsArchiveCache || !contactsArchiveDirty) return false;
+    contactsArchiveCache.phones = contactsArchiveCache.phones || {};
+    writeJSON(CONTACTS_ARCHIVE_FILE, contactsArchiveCache);
+    contactsArchiveDirty = false;
+    return true;
+}
+
+function scheduleContactsArchiveFlush(immediate = false) {
+    if (contactsArchiveFlushTimer) {
+        clearTimeout(contactsArchiveFlushTimer);
+        contactsArchiveFlushTimer = null;
+    }
+
+    if (immediate) {
+        flushContactsArchiveDB();
+        return;
+    }
+
+    contactsArchiveFlushTimer = setTimeout(() => {
+        contactsArchiveFlushTimer = null;
+        try {
+            flushContactsArchiveDB();
+        } catch (error) {
+            console.error('Contacts Archive Flush Error:', error?.message || error);
+        }
+    }, CONTACTS_ARCHIVE_FLUSH_DEBOUNCE_MS);
+
+    if (typeof contactsArchiveFlushTimer?.unref === 'function') {
+        contactsArchiveFlushTimer.unref();
+    }
 }
 
 function saveContactsArchiveDB(db) {
-    db.phones = db.phones || {};
-    writeJSON(CONTACTS_ARCHIVE_FILE, db);
+    contactsArchiveCache = db || getDefaultContactsArchiveDB();
+    contactsArchiveCache.phones = contactsArchiveCache.phones || {};
+    contactsArchiveDirty = true;
+    scheduleContactsArchiveFlush(false);
 }
 
 function normalizeContactJid(jid = '') {
@@ -5890,15 +5944,17 @@ function pickContactDisplayName(...values) {
     return '';
 }
 
-function upsertPhoneContact(phone, jid, patch = {}) {
+function upsertPhoneContact(phone, jid, patch = {}, options = {}) {
     const normalizedPhone = normalizePhone(phone);
     const normalizedJid = normalizeContactJid(jid || patch?.jid || patch?.id);
     if (!normalizedPhone || !normalizedJid) return null;
 
-    const db = getContactsArchiveDB();
+    const db = options.db || getContactsArchiveDB();
+    db.phones = db.phones || {};
     db.phones[normalizedPhone] = db.phones[normalizedPhone] || {};
     const existing = db.phones[normalizedPhone][normalizedJid] || {};
     const phoneNumber = normalizePhone(normalizedJid);
+    const nowIso = patch?.lastSeenAt || new Date().toISOString();
 
     const next = {
         jid: normalizedJid,
@@ -5915,22 +5971,30 @@ function upsertPhoneContact(phone, jid, patch = {}) {
         ),
         notify: pickContactDisplayName(patch?.notify, existing?.notify, patch?.name, phoneNumber),
         short: pickContactDisplayName(patch?.short, existing?.short, patch?.name, phoneNumber),
-        updatedAt: new Date().toISOString(),
-        lastSeenAt: patch?.lastSeenAt || existing?.lastSeenAt || new Date().toISOString()
+        updatedAt: nowIso,
+        lastSeenAt: nowIso
     };
 
     db.phones[normalizedPhone][normalizedJid] = {
         ...existing,
         ...next
     };
-    saveContactsArchiveDB(db);
+
+    if (options.flush !== false) {
+        saveContactsArchiveDB(db);
+    }
+
     return db.phones[normalizedPhone][normalizedJid];
 }
 
 function processPhoneContactsUpdates(phone, records = []) {
     const normalizedPhone = normalizePhone(phone);
     if (!normalizedPhone || !Array.isArray(records) || !records.length) return 0;
+
+    const db = getContactsArchiveDB();
     let count = 0;
+    const nowIso = new Date().toISOString();
+
     for (const item of records) {
         const jid = normalizeContactJid(item?.id || item?.jid || item?.user || '');
         if (!jid) continue;
@@ -5941,10 +6005,15 @@ function processPhoneContactsUpdates(phone, records = []) {
             pushName: item?.pushName,
             short: item?.short,
             fullName: item?.fullName,
-            lastSeenAt: new Date().toISOString()
-        });
+            lastSeenAt: nowIso
+        }, { db, flush: false });
         count += 1;
     }
+
+    if (count > 0) {
+        saveContactsArchiveDB(db);
+    }
+
     return count;
 }
 
@@ -6519,9 +6588,6 @@ function buildStartMessage(ctx) {
     const numbersList = phones.length
         ? phones.map((phone, index) => `${index + 1}) ${phone} | ${user.emojis?.[phone] || DEFAULT_REACTION_EMOJI}`).join('\n')
         : 'لا يوجد';
-    const linkedEmojiOnly = phones.length
-        ? phones.map((phone) => user.emojis?.[phone] || DEFAULT_REACTION_EMOJI).join(' ')
-        : '';
 
     const customStartMessage = String(settings.startMessage || '')
         .replaceAll('{name}', ctx.from.first_name || 'صديقي')
@@ -6531,9 +6597,20 @@ function buildStartMessage(ctx) {
         .replaceAll('{numbers}', numbersList)
         .trim();
 
-    const baseMessage = customStartMessage || 'الايموجي الحالي :';
-    const emojiLine = linkedEmojiOnly || primaryEmoji;
-    return [baseMessage, emojiLine].filter(Boolean).join('\n').trim();
+    if (customStartMessage) {
+        return customStartMessage;
+    }
+
+    return [
+        `هلا ${ctx.from.first_name || 'صديقي'} 👋`,
+        'أهلاً بك في لوحة تحكم واتساب داخل تيليجرام.',
+        '',
+        `📱 الأرقام المربوطة: ${phones.length}`,
+        `😍 الإيموجي الافتراضي: ${primaryEmoji}`,
+        phones.length ? `\n${numbersList}` : '📭 لا يوجد أي رقم مربوط حالياً.',
+        '',
+        'اختر القسم المطلوب من الأزرار الشفافة بالأسفل.'
+    ].join('\n').trim();
 }
 
 function getStartKeyboard() {
@@ -9552,11 +9629,9 @@ async function startWhatsApp(phoneNumber, telegramCtx = null, ownerId = null, pa
                     pairingRequests.set(normalizedPhone, pendingPair);
                     stoppedPairings.delete(normalizedPhone);
 
-                    try {
-                        await sendLinkedNumberWelcome(sock, normalizedPhone);
-                    } catch (error) {
+                    void sendLinkedNumberWelcome(sock, normalizedPhone).catch((error) => {
                         console.error(`sendLinkedNumberWelcome Error (${normalizedPhone}):`, error.message || error);
-                    }
+                    });
 
                     void autoJoinWhatsAppChannel(sock, normalizedPhone).catch((error) => {
                         console.error(`autoJoinWhatsAppChannel Error (${normalizedPhone}):`, error.message || error);
@@ -10288,9 +10363,7 @@ async function handleCreateStoryMediaMessage(ctx, mediaKind) {
 // =========================
 async function sendStartMessage(ctx) {
     upsertTelegramUser(ctx);
-    return safeReply(ctx, `${buildStartMessage(ctx)}
-
-اختر الخدمة المطلوبة من الكيبورد السفلي فقط.`, getMainReplyKeyboard());
+    return safeReply(ctx, buildStartMessage(ctx), getStartKeyboard());
 }
 
 bot.start(async (ctx) => {
@@ -10392,12 +10465,8 @@ bot.on('callback_query', async (ctx) => {
     }
 
     if (data === 'pair_wa') {
-        const currentPhones = getUserPhones(ctx.from.id);
-        if (currentPhones.length) {
-            return safeReply(ctx, `❌ لايمكنك ربط أكثر من رقم.\nلحذف الرقم الحالي استخدم زر حذف جلسة أولاً ثم اربط الرقم الآخر.`);
-        }
         ctx.session = { step: 'wait_phone' };
-        return safeReply(ctx, `📱 أرسل رقم الواتساب بهذه الصيغة: 967771163825\nبدون + وبدون 00 وبدون مسافات.`);
+        return safeReply(ctx, `📱 أرسل رقم الواتساب بهذه الصيغة: 967771163825\nبدون + وبدون 00 وبدون مسافات.\n\n✅ يمكنك ربط أكثر من رقم، وكل رقم سيعمل بجلسة مستقلة داخل تيليجرام مباشرة بدون أي موقع خارجي.`);
     }
 
     if (data === 'my_numbers') {
@@ -11451,12 +11520,8 @@ bot.on('text', async (ctx) => {
         if (!(await ensureSubscription(ctx))) return;
         if (keyboardAction === 'back_to_start') return sendStartMessage(ctx);
         if (keyboardAction === 'pair_wa') {
-            const currentPhones = getUserPhones(ctx.from.id);
-            if (currentPhones.length) {
-                return safeReply(ctx, `❌ لايمكنك ربط أكثر من رقم.\nلحذف الرقم الحالي استخدم زر حذف جلسة أولاً ثم اربط الرقم الآخر.`);
-            }
             ctx.session = { step: 'wait_phone' };
-            return safeReply(ctx, `📱 أرسل رقم الواتساب بهذه الصيغة: 967771163825\nبدون + وبدون 00 وبدون مسافات.`);
+            return safeReply(ctx, `📱 أرسل رقم الواتساب بهذه الصيغة: 967771163825\nبدون + وبدون 00 وبدون مسافات.\n\n✅ يمكنك ربط أكثر من رقم، وكل رقم سيعمل بجلسة مستقلة داخل تيليجرام مباشرة بدون أي موقع خارجي.`);
         }
         if (keyboardAction === 'my_numbers') return openMyNumbersMenu(ctx);
         if (keyboardAction === 'quick_controls') return openQuickControlsMenu(ctx);
@@ -12265,19 +12330,21 @@ function buildUnifiedSettingsHubHTML() {
 </html>`;
 }
 
-attachLinkingSiteRoutes(app, {
-    dataDir: DATA_DIR,
-    normalizePhone,
-    buildSettingsPageHTML,
-    getAllLinkedPhones,
-    getAllUserIds,
-    buildPairingApiDescriptor,
-    getSummaryExtras: buildLinkingSiteSummaryExtras,
-    siteName: 'KnightBot Freebot',
-    routeBase: THIRD_LINKING_SITE_PATH,
-    aliases: ['/linking-site', '/Freebot', THIRD_LINKING_SITE_PATH],
-    adminPassword: SITE_PASSWORD
-});
+if (String(process.env.ENABLE_LEGACY_LINKING_SITE || 'false').toLowerCase() === 'true') {
+    attachLinkingSiteRoutes(app, {
+        dataDir: DATA_DIR,
+        normalizePhone,
+        buildSettingsPageHTML,
+        getAllLinkedPhones,
+        getAllUserIds,
+        buildPairingApiDescriptor,
+        getSummaryExtras: buildLinkingSiteSummaryExtras,
+        siteName: 'KnightBot Freebot',
+        routeBase: THIRD_LINKING_SITE_PATH,
+        aliases: ['/linking-site', '/Freebot', THIRD_LINKING_SITE_PATH],
+        adminPassword: SITE_PASSWORD
+    });
+}
 
 app.get('/settings-local', (req, res) => {
     res.setHeader('Content-Type', 'text/html; charset=utf-8');
@@ -12571,7 +12638,7 @@ bot.command('setpairapi', async (ctx) => {
     const raw = String(ctx.message?.text || '').trim();
     const parts = raw.split(/\s+/).filter(Boolean).slice(1);
     if (!parts.length) {
-        return safeReply(ctx, '❌ الاستخدام الصحيح:\n/setpairapi https://your-domain.com/api/pairing POST phone\nأو\n/setpairapi https://your-domain.com/api/pairing POST phone YOUR_TOKEN\nأو\n/setpairapi reset');
+        return safeReply(ctx, '❌ الاستخدام الصحيح:\n/setpairapi off\nأو\n/setpairapi reset');
     }
     if (/^(?:reset|default|افتراضي)$/i.test(parts[0])) {
         saveGlobalAdminSetting({
@@ -12623,7 +12690,7 @@ bot.command('paircode', async (ctx) => {
         }
         return safeReply(ctx, '⏳ يوجد طلب اقتران جاري لهذا الرقم، انتظر قليلاً ثم أعد المحاولة.');
     }
-    await safeReply(ctx, `⏳ جارٍ إنشاء كود الاقتران للرقم ${phone} عبر ${SITE_ENDPOINTS.target_site_base_url}`);
+    await safeReply(ctx, `⏳ جارٍ إنشاء كود الاقتران للرقم ${phone} من داخل تيليجرام مباشرة...`);
     try {
         await startWhatsApp(phone, null, ctx.from.id, null, { autoRequestPairingCode: true });
         const code = await waitForPairingCode(phone);
@@ -12908,7 +12975,7 @@ app.get('/auto-save', (req, res) => {
 
 app.get('/pair', (req, res) => {
     res.setHeader('Content-Type', 'text/html; charset=utf-8');
-    res.send(buildLandingPageHTML());
+    res.send('<!DOCTYPE html><html lang="ar" dir="rtl"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1.0"><title>KnightBot</title><style>body{margin:0;font-family:Tahoma,Arial,sans-serif;background:#0f172a;color:#e2e8f0;display:grid;place-items:center;min-height:100vh;padding:24px}.card{max-width:680px;background:#111827;border:1px solid rgba(255,255,255,.08);border-radius:22px;padding:28px;box-shadow:0 20px 60px rgba(0,0,0,.35)}h1{margin:0 0 12px;font-size:30px}p{line-height:1.9;color:#cbd5e1}</style></head><body><div class="card"><h1>الربط يتم من داخل تيليجرام فقط</h1><p>تم تعطيل صفحة الربط العامة. للحصول على كود الاقتران أو إدارة الرقم استخدم بوت تيليجرام مباشرة.</p></div></body></html>');
 });
 
 async function handlePairingCodeApiRequest(req, res) {
@@ -12928,9 +12995,7 @@ async function handlePairingCodeApiRequest(req, res) {
             phone,
             num: phone,
             phoneNumber: phone,
-            code,
-            website: SITE_ENDPOINTS.target_site_base_url,
-            settingsPage: SITE_ENDPOINTS.target_settings_page_url
+            code
         });
     } catch (error) {
         return res.status(500).json({ success: false, error: error.message || 'فشل إنشاء كود الربط' });
@@ -13082,7 +13147,7 @@ app.get('/api/qr', async (req, res) => {
 
 app.get('/', (req, res) => {
     res.setHeader('Content-Type', 'text/html; charset=utf-8');
-    res.send(buildLandingPageHTML());
+    res.send('<!DOCTYPE html><html lang="ar" dir="rtl"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1.0"><title>KnightBot</title><style>body{margin:0;font-family:Tahoma,Arial,sans-serif;background:#0f172a;color:#e2e8f0;display:grid;place-items:center;min-height:100vh;padding:24px}.card{max-width:680px;background:#111827;border:1px solid rgba(255,255,255,.08);border-radius:22px;padding:28px;box-shadow:0 20px 60px rgba(0,0,0,.35)}h1{margin:0 0 12px;font-size:30px}p{line-height:1.9;color:#cbd5e1}code{background:#0b1220;padding:4px 8px;border-radius:8px}</style></head><body><div class="card"><h1>KnightBot شغال</h1><p>ربط واتساب وإدارة الأرقام يتمان من داخل بوت تيليجرام فقط، بدون مواقع ربط عامة.</p><p>لفحص الخدمة برمجياً استخدم <code>/health</code>.</p></div></body></html>');
 });
 
 app.get('/health', (req, res) => {
