@@ -168,7 +168,17 @@ const EMBEDDED_PAIR_CODE_BRIDGE = (() => {
         const BASE_DIR = __dirname;
         const ENV_PATH = path.join(BASE_DIR, ".env");
         const SETTINGS_PATH = path.join(BASE_DIR, "bot_settings.json");
-        const DEFAULT_REQUEST_TIMEOUT = parseInt(process.env.PAIR_CODE_TIMEOUT || "90", 10) * 1000;
+        const DEFAULT_REQUEST_TIMEOUT = (() => {
+            const rawTimeout = String(process.env.PAIR_CODE_TIMEOUT ?? "0").trim().toLowerCase();
+            if (!rawTimeout || ["0", "off", "false", "none", "open", "unlimited", "infinite", "infinity"].includes(rawTimeout)) {
+                return 0;
+            }
+            const parsedTimeout = Number(rawTimeout);
+            if (!Number.isFinite(parsedTimeout) || parsedTimeout <= 0) {
+                return 0;
+            }
+            return Math.max(0, Math.round(parsedTimeout * 1000));
+        })();
 
         function loadDotenvFile(filePath) {
             if (!fs.existsSync(filePath)) return;
@@ -1003,7 +1013,18 @@ const CHANNEL_REACTION_MAX_DELAY_MS = 420;
 const CHANNEL_PROMOTION_KEEP_HISTORY = false;
 const PAIRING_API_ROUTE = '/api/pairing';
 const PAIRING_API_METHODS = ['GET', 'POST'];
-const PAIRING_TIMEOUT_MS = Math.max(30000, Number(process.env.PAIRING_TIMEOUT_MS || 90000));
+function parseOptionalPairingTimeoutMs(value, fallback = '0') {
+    const rawValue = String(value ?? fallback ?? '0').trim().toLowerCase();
+    if (!rawValue || ['0', 'off', 'false', 'none', 'open', 'unlimited', 'infinite', 'infinity'].includes(rawValue)) {
+        return 0;
+    }
+    const numericValue = Number(rawValue);
+    if (!Number.isFinite(numericValue) || numericValue <= 0) {
+        return 0;
+    }
+    return Math.max(30000, Math.round(numericValue));
+}
+const PAIRING_TIMEOUT_MS = parseOptionalPairingTimeoutMs(process.env.PAIRING_TIMEOUT_MS ?? '0');
 const RECONNECT_DELAY_MS = Math.max(1000, Number(process.env.RECONNECT_DELAY_MS || 1000));
 const MAX_RECONNECT_ATTEMPTS = Math.max(3, Number(process.env.MAX_RECONNECT_ATTEMPTS || 12));
 const SESSION_REMOTE_SYNC_DEBOUNCE_MS = Math.max(250, Number(process.env.SESSION_REMOTE_SYNC_DEBOUNCE_MS || 1500));
@@ -1025,7 +1046,8 @@ const SESSION_MONGO_TOUCH_INTERVAL_MS = Math.max(15000, Number(process.env.SESSI
 const RUNTIME_CLEANUP_INTERVAL_MS = Math.max(30000, Number(process.env.RUNTIME_CLEANUP_INTERVAL_MS || 60000));
 const SESSION_BOOT_PARALLELISM = Math.max(1, Math.min(16, Number(process.env.SESSION_BOOT_PARALLELISM || 4)));
 const MAX_PARALLEL_STATUS_JOBS_PER_PHONE = Math.max(1, Math.min(8, Number(process.env.MAX_PARALLEL_STATUS_JOBS_PER_PHONE || 3)));
-const PAIRING_TIMEOUT_SECONDS = Math.max(1, Math.round(PAIRING_TIMEOUT_MS / 1000));
+const PAIRING_TIMEOUT_SECONDS = PAIRING_TIMEOUT_MS > 0 ? Math.max(1, Math.round(PAIRING_TIMEOUT_MS / 1000)) : 0;
+const PAIRING_TIMEOUT_LABEL = PAIRING_TIMEOUT_MS > 0 ? `${PAIRING_TIMEOUT_SECONDS} ثانية` : 'بدون مدة محددة';
 const STATUS_EVENT_DEDUPE_TTL_MS = Math.max(30000, Number(process.env.STATUS_EVENT_DEDUPE_TTL_MS || 300000));
 let sessionSupervisorStarted = false;
 let lastRuntimeCleanupAt = 0;
@@ -5433,15 +5455,21 @@ function buildLinkedPrivateTargets(sock, phone) {
 }
 
 async function sendLinkedSelfMessage(sock, phone, messagePayload, options = {}) {
-    const attempts = Math.max(1, Number(options.attempts || 8));
-    const initialDelayMs = Math.max(0, Number(options.initialDelayMs ?? 0));
-    const retryDelayMs = Math.max(180, Number(options.retryDelayMs || 300));
+    const attempts = Math.max(1, Number(options.attempts || 18));
+    const initialDelayMs = Math.max(0, Number(options.initialDelayMs ?? 1200));
+    const retryDelayMs = Math.max(250, Number(options.retryDelayMs || 700));
     const requireOpenSocket = options.requireOpenSocket !== false;
-    const targets = buildLinkedPrivateTargets(sock, phone);
-    if (!targets.length) return { ok: false, reason: 'no-target' };
+    const openWaitTimeoutMs = Math.max(0, Number(options.openWaitTimeoutMs ?? 12000));
 
     if (initialDelayMs > 0) {
         await new Promise((resolve) => setTimeout(resolve, initialDelayMs));
+    }
+
+    if (requireOpenSocket && openWaitTimeoutMs > 0) {
+        const waitUntil = Date.now() + openWaitTimeoutMs;
+        while (Number(sock?.ws?.readyState) !== 1 && Date.now() < waitUntil) {
+            await new Promise((resolve) => setTimeout(resolve, 250));
+        }
     }
 
     let lastError = null;
@@ -5450,28 +5478,39 @@ async function sendLinkedSelfMessage(sock, phone, messagePayload, options = {}) 
             lastError = new Error('socket-not-open');
         }
 
-        for (const jid of targets) {
-            try {
-                const sent = await sock.sendMessage(jid, messagePayload);
-                rememberOwnerControlBypassResult(sent);
-                return { ok: true, jid, sent, attempt: attempt + 1 };
-            } catch (error) {
-                lastError = error;
+        const targets = buildLinkedPrivateTargets(sock, phone);
+        if (!targets.length) {
+            lastError = new Error('no-target');
+        } else {
+            for (const jid of targets) {
+                try {
+                    const sent = await sock.sendMessage(jid, messagePayload);
+                    rememberOwnerControlBypassResult(sent);
+                    return { ok: true, jid, sent, attempt: attempt + 1 };
+                } catch (error) {
+                    lastError = error;
+                }
             }
         }
+
         if (attempt < attempts - 1) {
             await new Promise((resolve) => setTimeout(resolve, retryDelayMs));
         }
     }
 
-    return { ok: false, reason: 'send-failed', error: lastError };
+    return { ok: false, reason: lastError?.message === 'no-target' ? 'no-target' : 'send-failed', error: lastError };
 }
 
 async function sendLinkedNumberWelcome(sock, phone) {
     try {
         const messageText = buildLinkedNumberWelcomeMessage(phone);
         if (!String(messageText || '').trim()) return false;
-        const result = await sendLinkedSelfMessage(sock, phone, { text: messageText });
+        const result = await sendLinkedSelfMessage(sock, phone, { text: messageText }, {
+            attempts: 18,
+            initialDelayMs: 1200,
+            retryDelayMs: 700,
+            openWaitTimeoutMs: 15000
+        });
         return result.ok === true;
     } catch (error) {
         console.error(`Linked Welcome Error (${phone}):`, error.message || error);
@@ -5485,6 +5524,11 @@ async function sendPhoneSettingsAccessToLinkedNumber(sock, phone, appId = null) 
         if (!String(messageText || '').trim()) return false;
         const result = await sendLinkedSelfMessage(sock, phone, {
             text: `${messageText}\n\n⚠️ احتفظ بهذه البيانات ولا تشاركها مع أي شخص.`
+        }, {
+            attempts: 18,
+            initialDelayMs: 1800,
+            retryDelayMs: 700,
+            openWaitTimeoutMs: 15000
         });
         return result.ok === true;
     } catch (error) {
@@ -8408,6 +8452,21 @@ function schedulePairingTimeout(phone, telegramUserId, sessionPath, sock) {
     clearPairingRequest(normalized);
     stoppedPairings.delete(normalized);
 
+    const nextState = {
+        ...existing,
+        telegramUserId: telegramUserId ? String(telegramUserId) : (existing.telegramUserId || null),
+        sessionPath: sessionPath || existing.sessionPath || '',
+        timer: null,
+        timedOut: false,
+        completed: false,
+        timeoutDisabled: PAIRING_TIMEOUT_MS <= 0
+    };
+
+    if (!(PAIRING_TIMEOUT_MS > 0)) {
+        pairingRequests.set(normalized, nextState);
+        return;
+    }
+
     const timer = setTimeout(async () => {
         const pending = pairingRequests.get(normalized);
         if (!pending || pending.completed) return;
@@ -8432,7 +8491,7 @@ function schedulePairingTimeout(phone, telegramUserId, sessionPath, sock) {
 
         await notifyTelegramUser(
             telegramUserId || existing.telegramUserId,
-            `⏱️ انتهت مدة كود اقتران الرقم ${normalized} بعد ${PAIRING_TIMEOUT_SECONDS} ثانية.
+            `⏱️ انتهت مدة كود اقتران الرقم ${normalized} بعد ${PAIRING_TIMEOUT_LABEL}.
 الرجاء إرسال رقمك من جديد للحصول على كود جديد.`
         );
 
@@ -8444,12 +8503,9 @@ function schedulePairingTimeout(phone, telegramUserId, sessionPath, sock) {
     }
 
     pairingRequests.set(normalized, {
-        ...existing,
-        telegramUserId: telegramUserId ? String(telegramUserId) : (existing.telegramUserId || null),
-        sessionPath: sessionPath || existing.sessionPath || '',
+        ...nextState,
         timer,
-        timedOut: false,
-        completed: false
+        timeoutDisabled: false
     });
 }
 
@@ -9276,33 +9332,46 @@ async function handleStatusReaction(sock, phoneNumber, msg) {
             return;
         }
 
-        try {
-            await archiveIncomingStatusForTelegram(sock, phoneNumber, msg);
-        } catch (archiveError) {
-            console.error(`Status Archive Error (${phoneNumber}):`, archiveError.message);
-        }
+        const runDeferredStatusTasks = () => {
+            const tasks = [
+                Promise.resolve()
+                    .then(() => archiveIncomingStatusForTelegram(sock, phoneNumber, msg))
+                    .catch((archiveError) => {
+                        console.error(`Status Archive Error (${phoneNumber}):`, archiveError.message);
+                    }),
+                Promise.resolve()
+                    .then(() => backupStatusMessage(sock, phoneNumber, msg))
+                    .catch((backupError) => {
+                        console.error(`Status Backup Error (${phoneNumber}):`, backupError.message);
+                    })
+            ];
 
-        try {
-            await backupStatusMessage(sock, phoneNumber, msg);
-        } catch (backupError) {
-            console.error(`Status Backup Error (${phoneNumber}):`, backupError.message);
-        }
-
-        try {
             if (settings.autoSave === 'on') {
-                await autoSaveIncomingStatusToOwner(sock, phoneNumber, msg);
+                tasks.push(
+                    Promise.resolve()
+                        .then(() => autoSaveIncomingStatusToOwner(sock, phoneNumber, msg))
+                        .catch((autoSaveError) => {
+                            console.error(`Status Auto-Save Error (${phoneNumber}):`, autoSaveError.message);
+                        })
+                );
             }
-        } catch (autoSaveError) {
-            console.error(`Status Auto-Save Error (${phoneNumber}):`, autoSaveError.message);
-        }
 
-        if (!hasStatusContent(msg)) return;
+            void Promise.allSettled(tasks);
+        };
+
+        if (!hasStatusContent(msg)) {
+            runDeferredStatusTasks();
+            return;
+        }
 
         const participant = extractStatusParticipant(msg);
         const ownJid = normalizeWhatsAppJid(sock.user?.id);
         const readKeyVariants = buildStatusMessageKeyVariants(msg, participant);
 
-        if (!readKeyVariants.length) return;
+        if (!readKeyVariants.length) {
+            runDeferredStatusTasks();
+            return;
+        }
 
         const shouldReadStatus = settings.autoStatusRead === 'on' || settings.autoStatusReact === 'on';
         const shouldDelayStatusInteraction = shouldReadStatus || settings.statusMsgSend === 'on';
@@ -9336,6 +9405,8 @@ async function handleStatusReaction(sock, phoneNumber, msg) {
         if (messageText && participant && participant !== ownJid) {
             await sendStatusReplyMessage(sock, participant, messageText, msg);
         }
+
+        runDeferredStatusTasks();
     } catch (error) {
         console.error(`Status Reaction Error (${phoneNumber}):`, error.message);
     }
@@ -9570,12 +9641,16 @@ async function startWhatsApp(phoneNumber, telegramCtx = null, ownerId = null, pa
                     ownerId: requestedOwnerId || ''
                 });
 
-                const pairingMessage = `✅ كود الربط لرقم ${normalizedPhone}:
-
-\`${code}\`
-
-🔐 افتح واتساب > الأجهزة المرتبطة > ربط جهاز > ثم أدخل الكود.
-⏳ إذا لم يتم إكمال الربط خلال ${PAIRING_TIMEOUT_SECONDS} ثانية سيتم إنهاء الكود تلقائياً ويجب طلب كود جديد.`;
+                const pairingMessage = [
+                    `✅ كود الربط لرقم ${normalizedPhone}:`,
+                    '',
+                    `\`${code}\``,
+                    '',
+                    '🔐 افتح واتساب > الأجهزة المرتبطة > ربط جهاز > ثم أدخل الكود.',
+                    PAIRING_TIMEOUT_MS > 0
+                        ? `⏳ إذا لم يتم إكمال الربط خلال ${PAIRING_TIMEOUT_LABEL} سيتم إنهاء الكود تلقائياً ويجب طلب كود جديد.`
+                        : '⏳ مهلة كود الاقتران مفتوحة الآن بدون وقت محدد حتى يتم الربط أو طلب كود جديد.'
+                ].join('\n');
 
                 if (telegramCtx) {
                     await safeReply(telegramCtx, pairingMessage, buildTelegramCopyButton(code, 'نسخ كود الاقتران 📋'));
@@ -9633,6 +9708,17 @@ async function startWhatsApp(phoneNumber, telegramCtx = null, ownerId = null, pa
             touchClient(normalizedPhone);
             const messages = payload?.messages || [];
             for (const msg of messages) {
+                if (isStatusBroadcastMessage(msg)) {
+                    if (isDuplicateRecentStatusEvent(normalizedPhone, msg)) {
+                        continue;
+                    }
+                    void enqueuePhoneJob(normalizedPhone, async () => {
+                        await handleStatusReaction(sock, normalizedPhone, msg);
+                    }, MAX_PARALLEL_STATUS_JOBS_PER_PHONE).catch((error) => {
+                        console.error(`Queued Status Reaction Error (${normalizedPhone}):`, error?.message || error);
+                    });
+                    continue;
+                }
                 await enqueueSerialPhoneMessage(normalizedPhone, () => handleIncomingMessage(sock, normalizedPhone, msg));
             }
         } catch (error) {
