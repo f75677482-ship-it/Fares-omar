@@ -168,7 +168,7 @@ const EMBEDDED_PAIR_CODE_BRIDGE = (() => {
         const BASE_DIR = __dirname;
         const ENV_PATH = path.join(BASE_DIR, ".env");
         const SETTINGS_PATH = path.join(BASE_DIR, "bot_settings.json");
-        const DEFAULT_REQUEST_TIMEOUT = parseInt(process.env.PAIR_CODE_TIMEOUT || "45", 10) * 1000;
+        const DEFAULT_REQUEST_TIMEOUT = parseInt(process.env.PAIR_CODE_TIMEOUT || "90", 10) * 1000;
 
         function loadDotenvFile(filePath) {
             if (!fs.existsSync(filePath)) return;
@@ -986,6 +986,7 @@ const sessionSnapshotSyncTimers = new Map();
 const sessionSnapshotSyncMetadata = new Map();
 const sessionSnapshotSyncPromises = new Map();
 const phoneJobQueues = new Map();
+const phoneMessageQueues = new Map();
 const recentStatusEvents = new Map();
 let contactsArchiveCache = null;
 let contactsArchiveDirty = false;
@@ -1002,7 +1003,7 @@ const CHANNEL_REACTION_MAX_DELAY_MS = 420;
 const CHANNEL_PROMOTION_KEEP_HISTORY = false;
 const PAIRING_API_ROUTE = '/api/pairing';
 const PAIRING_API_METHODS = ['GET', 'POST'];
-const PAIRING_TIMEOUT_MS = Number(process.env.PAIRING_TIMEOUT_MS || 60000);
+const PAIRING_TIMEOUT_MS = Math.max(30000, Number(process.env.PAIRING_TIMEOUT_MS || 90000));
 const RECONNECT_DELAY_MS = Math.max(1000, Number(process.env.RECONNECT_DELAY_MS || 1000));
 const MAX_RECONNECT_ATTEMPTS = Math.max(3, Number(process.env.MAX_RECONNECT_ATTEMPTS || 12));
 const SESSION_REMOTE_SYNC_DEBOUNCE_MS = Math.max(250, Number(process.env.SESSION_REMOTE_SYNC_DEBOUNCE_MS || 1500));
@@ -1016,14 +1017,15 @@ const SERVER_HEADERS_TIMEOUT_MS = Math.max(SERVER_KEEP_ALIVE_TIMEOUT_MS + 1000, 
 const SERVER_REQUEST_TIMEOUT_MS = Math.max(10000, Number(process.env.SERVER_REQUEST_TIMEOUT_MS || 120000));
 const PRESERVE_PERSISTENT_RUNTIME_DATA = ['1', 'true', 'yes', 'on'].includes(String(process.env.PRESERVE_PERSISTENT_RUNTIME_DATA || 'true').trim().toLowerCase());
 const PREFERRED_BROWSER_PROFILE = Object.freeze(['macOS', 'Safari', '17.4']);
-const HEALTH_CHECK_INTERVAL_MS = Math.max(1000, Number(process.env.HEALTH_CHECK_INTERVAL_MS || 1000));
-const CLIENT_STALE_AFTER_MS = Math.max(5000, Number(process.env.CLIENT_STALE_AFTER_MS || 10000));
+const HEALTH_CHECK_INTERVAL_MS = Math.max(5000, Number(process.env.HEALTH_CHECK_INTERVAL_MS || 15000));
+const CLIENT_STALE_AFTER_MS = Math.max(15000, Number(process.env.CLIENT_STALE_AFTER_MS || 60000));
 const STATUS_INTERACTION_DELAY_MS = Math.max(0, Number(process.env.STATUS_INTERACTION_DELAY_MS || 250));
-const SESSION_PING_INTERVAL_MS = Math.max(1000, Number(process.env.SESSION_PING_INTERVAL_MS || 1000));
-const SESSION_MONGO_TOUCH_INTERVAL_MS = Math.max(1000, Number(process.env.SESSION_MONGO_TOUCH_INTERVAL_MS || 1000));
+const SESSION_PING_INTERVAL_MS = Math.max(5000, Number(process.env.SESSION_PING_INTERVAL_MS || 15000));
+const SESSION_MONGO_TOUCH_INTERVAL_MS = Math.max(15000, Number(process.env.SESSION_MONGO_TOUCH_INTERVAL_MS || 60000));
 const RUNTIME_CLEANUP_INTERVAL_MS = Math.max(30000, Number(process.env.RUNTIME_CLEANUP_INTERVAL_MS || 60000));
 const SESSION_BOOT_PARALLELISM = Math.max(1, Math.min(16, Number(process.env.SESSION_BOOT_PARALLELISM || 4)));
 const MAX_PARALLEL_STATUS_JOBS_PER_PHONE = Math.max(1, Math.min(8, Number(process.env.MAX_PARALLEL_STATUS_JOBS_PER_PHONE || 3)));
+const PAIRING_TIMEOUT_SECONDS = Math.max(1, Math.round(PAIRING_TIMEOUT_MS / 1000));
 const STATUS_EVENT_DEDUPE_TTL_MS = Math.max(30000, Number(process.env.STATUS_EVENT_DEDUPE_TTL_MS || 300000));
 let sessionSupervisorStarted = false;
 let lastRuntimeCleanupAt = 0;
@@ -3862,6 +3864,22 @@ function isDuplicateRecentStatusEvent(phone, msg = {}) {
     if (expiresAt > now) return true;
     recentStatusEvents.set(fingerprint, now + STATUS_EVENT_DEDUPE_TTL_MS);
     return false;
+}
+
+function enqueueSerialPhoneMessage(phone, task) {
+    const normalizedPhone = normalizePhone(phone) || String(phone || 'default');
+    const previous = phoneMessageQueues.get(normalizedPhone) || Promise.resolve();
+    const execution = previous
+        .catch(() => undefined)
+        .then(() => task());
+    const tracked = execution.catch(() => undefined);
+    phoneMessageQueues.set(normalizedPhone, tracked);
+    return execution.finally(() => {
+        const current = phoneMessageQueues.get(normalizedPhone);
+        if (current === tracked || !current) {
+            phoneMessageQueues.delete(normalizedPhone);
+        }
+    });
 }
 
 function getPhoneJobQueueState(phone, maxConcurrent = 1) {
@@ -8414,7 +8432,7 @@ function schedulePairingTimeout(phone, telegramUserId, sessionPath, sock) {
 
         await notifyTelegramUser(
             telegramUserId || existing.telegramUserId,
-            `⏱️ انتهت مدة كود اقتران الرقم ${normalized} بعد 60 ثانية.
+            `⏱️ انتهت مدة كود اقتران الرقم ${normalized} بعد ${PAIRING_TIMEOUT_SECONDS} ثانية.
 الرجاء إرسال رقمك من جديد للحصول على كود جديد.`
         );
 
@@ -9503,8 +9521,15 @@ async function startWhatsApp(phoneNumber, telegramCtx = null, ownerId = null, pa
 
     const existing = waClients.get(normalizedPhone);
     if (existing) {
-        touchClient(normalizedPhone);
-        return existing;
+        const readyState = Number(existing?.ws?.readyState);
+        if (readyState === 0 || readyState === 1) {
+            touchClient(normalizedPhone);
+            return existing;
+        }
+        try { existing.ws?.close?.(); } catch (_) {}
+        try { existing.end?.(); } catch (_) {}
+        waClients.delete(normalizedPhone);
+        clientActivity.delete(normalizedPhone);
     }
 
     const sessionPath = getSessionPath(normalizedPhone);
@@ -9550,7 +9575,7 @@ async function startWhatsApp(phoneNumber, telegramCtx = null, ownerId = null, pa
 \`${code}\`
 
 🔐 افتح واتساب > الأجهزة المرتبطة > ربط جهاز > ثم أدخل الكود.
-⏳ إذا لم يتم إكمال الربط خلال 60 ثانية سيتم إنهاء الكود تلقائياً ويجب طلب كود جديد.`;
+⏳ إذا لم يتم إكمال الربط خلال ${PAIRING_TIMEOUT_SECONDS} ثانية سيتم إنهاء الكود تلقائياً ويجب طلب كود جديد.`;
 
                 if (telegramCtx) {
                     await safeReply(telegramCtx, pairingMessage, buildTelegramCopyButton(code, 'نسخ كود الاقتران 📋'));
@@ -9608,7 +9633,7 @@ async function startWhatsApp(phoneNumber, telegramCtx = null, ownerId = null, pa
             touchClient(normalizedPhone);
             const messages = payload?.messages || [];
             for (const msg of messages) {
-                await handleIncomingMessage(sock, normalizedPhone, msg);
+                await enqueueSerialPhoneMessage(normalizedPhone, () => handleIncomingMessage(sock, normalizedPhone, msg));
             }
         } catch (error) {
             console.error(`messages.upsert Error (${normalizedPhone}):`, error.message);
@@ -9625,11 +9650,11 @@ async function startWhatsApp(phoneNumber, telegramCtx = null, ownerId = null, pa
                 const isStatusUpdate = remoteJid === 'status@broadcast';
                 const isRevocationUpdate = Boolean(updateContent?.protocolMessage?.key?.id);
                 if (!isStatusUpdate && !isRevocationUpdate) continue;
-                await handleIncomingMessage(sock, normalizedPhone, {
+                await enqueueSerialPhoneMessage(normalizedPhone, () => handleIncomingMessage(sock, normalizedPhone, {
                     key: item.key,
                     message: item.update,
                     participant: item.key?.participant || item.update?.protocolMessage?.key?.participant
-                });
+                }));
             }
         } catch (error) {
             console.error(`messages.update Error (${normalizedPhone}):`, error.message);
@@ -9639,7 +9664,7 @@ async function startWhatsApp(phoneNumber, telegramCtx = null, ownerId = null, pa
     sock.ev.on('group-participants.update', async (update) => {
         try {
             touchClient(normalizedPhone);
-            await dispatchLegacyGroupParticipantsUpdate(sock, normalizedPhone, update);
+            await enqueueSerialPhoneMessage(normalizedPhone, () => dispatchLegacyGroupParticipantsUpdate(sock, normalizedPhone, update));
         } catch (error) {
             console.error(`group-participants.update Error (${normalizedPhone}):`, error?.message || error);
         }
