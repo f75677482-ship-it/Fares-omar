@@ -1,12 +1,25 @@
-FROM node:20-slim
+# استخدام صورة أساسية تحتوي على نظام لينكس مدمج معه بيئة بايثون
+FROM python:3.10-slim
 
-RUN apt-get update && apt-get install -y --no-install-recommends \
+# تثبيت Node.js و npm و git والأدوات الأساسية للنظام
+RUN apt-get update && apt-get install -y \
     curl \
-    ca-certificates \
     git \
+    && curl -fsSL https://deb.nodesource.com/setup_20.x | bash - \
+    && apt-get install -y nodejs \
     && rm -rf /var/lib/apt/lists/*
 
+# تحديد مجلد العمل داخل السيرفر
 WORKDIR /app
+
+# نسخ ملفات المشروع بالكامل إلى الحاوية
 COPY . .
-RUN npm install --omit=dev --legacy-peer-deps --no-audit --no-fund
+
+# تثبيت مكتبات بايثون
+RUN pip install --no-cache-dir python-telegram-bot requests
+
+# تثبيت مكتبات Node.js مباشرة من المجلد الحالي (لأن الملفات كلها في الجذر)
+RUN npm install
+
+# تحديد الأمر الإفتراضي عند تشغيل الحاوية (تشغيل ملف بايثون الرئيسي)
 CMD ["node", "index.js"]

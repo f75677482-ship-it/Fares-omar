@@ -1,11 +1,9 @@
 [phases.setup]
-apt_pkgs = ["nodejs", "npm"]
-nix_pkgs = ["nodejs_20"]
+# تشغيل Python + Node معًا لأن bot_core.py يشغّل محرك واتساب المحلي من نفس المشروع
+nixPkgs = ["python311", "nodejs_20", "libatomic1"]
 
 [phases.install]
-cmds = [
-  "npm install --omit=dev --legacy-peer-deps --no-audit --no-fund",
-]
+cmds = ["pip install -r requirements.txt", "npm install --legacy-peer-deps"]
 
 [start]
-cmd = "node index.js"
+cmd = "python bot_core.py"

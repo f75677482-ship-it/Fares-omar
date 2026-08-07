@@ -26,14 +26,9 @@ const startPromises = new Map();
 const reconnectTimers = new Map();
 const heartbeatTimers = new Map();
 const pairingRequests = new Map();
-const linkedNoticeCache = new Map();
 const RECONNECT_DELAY_MS = Math.max(1000, Number(process.env.RECONNECT_DELAY_MS || 1000));
-const PAIRING_CODE_CACHE_MS = Math.max(12000, Number(process.env.PAIRING_CODE_CACHE_MS || 45000));
+const PAIRING_CODE_CACHE_MS = Math.max(30000, Number(process.env.PAIRING_CODE_CACHE_MS || 55000));
 const SESSION_HEARTBEAT_INTERVAL_MS = Math.max(1000, Number(process.env.SESSION_HEARTBEAT_INTERVAL_MS || 1000));
-const SESSION_WATCHDOG_INTERVAL_MS = Math.max(1000, Number(process.env.SESSION_WATCHDOG_INTERVAL_MS || 1000));
-const LINKED_NOTICE_TTL_MS = Math.max(60000, Number(process.env.LINKED_NOTICE_TTL_MS || 15 * 60 * 1000));
-const PAIRING_SUCCESS_WEBHOOK_URL = String(process.env.PAIRING_SUCCESS_WEBHOOK_URL || '').trim();
-const DIRECT_LINKED_NOTICE_TEXT = String(process.env.DIRECT_LINKED_NOTICE_TEXT || '✅ تم ربط رقمك بنجاح وحفظ الجلسة داخل البوت.\n♻️ سيتم الحفاظ على اتصال هذا الرقم تلقائيًا.\n📩 ستصلك تفاصيل الإعدادات تلقائيًا عند توفرها.').trim();
 const SESSION_COLLECTION_NAME = String(process.env.MONGODB_SESSIONS_COLLECTION || 'whatsapp_sessions').trim() || 'whatsapp_sessions';
 const MONGODB_DB_NAME = String(process.env.MONGODB_DB_NAME || 'whatsapp_pairing_api').trim() || 'whatsapp_pairing_api';
 const SESSION_STORE_TIMEOUT_MS = Math.max(5000, Number(process.env.SESSION_STORAGE_TIMEOUT_MS || 20000));
@@ -329,105 +324,6 @@ function clearHeartbeat(phone) {
   }
 }
 
-function buildLinkedPrivateTargets(sock, phone) {
-  const normalized = normalizePhone(phone);
-  const ownJid = String(sock?.user?.id || '').trim();
-  const phoneJid = normalized ? `${normalized}@s.whatsapp.net` : '';
-  return Array.from(new Set([phoneJid, ownJid].filter(Boolean)));
-}
-
-async function sendLinkedSelfMessage(sock, phone, messagePayload, options = {}) {
-  const targets = buildLinkedPrivateTargets(sock, phone);
-  if (!targets.length || !sock || typeof sock.sendMessage !== 'function') {
-    return { ok: false, reason: 'no-target' };
-  }
-
-  const attempts = Math.max(1, Number(options.attempts || 4));
-  const initialDelayMs = Math.max(0, Number(options.initialDelayMs || 250));
-  const retryDelayMs = Math.max(150, Number(options.retryDelayMs || 350));
-
-  if (initialDelayMs > 0) await delay(initialDelayMs);
-
-  let lastError = null;
-  for (let attempt = 0; attempt < attempts; attempt += 1) {
-    for (const jid of targets) {
-      try {
-        const sent = await sock.sendMessage(jid, messagePayload);
-        return { ok: true, jid, sent };
-      } catch (error) {
-        lastError = error;
-      }
-    }
-    if (attempt < attempts - 1) await delay(retryDelayMs);
-  }
-
-  return { ok: false, reason: 'send-failed', error: lastError };
-}
-
-async function sendDirectLinkedNotice(sock, phone, force = false) {
-  const normalized = normalizePhone(phone);
-  if (!normalized || !DIRECT_LINKED_NOTICE_TEXT) return false;
-  const lastSentAt = Number(linkedNoticeCache.get(normalized) || 0);
-  if (!force && lastSentAt && (Date.now() - lastSentAt) < LINKED_NOTICE_TTL_MS) return true;
-
-  const messageText = [DIRECT_LINKED_NOTICE_TEXT, `📞 الرقم: ${normalized}`].filter(Boolean).join('\n');
-  const result = await sendLinkedSelfMessage(sock, normalized, { text: messageText }, { attempts: 5, initialDelayMs: 300, retryDelayMs: 400 });
-  if (result.ok) linkedNoticeCache.set(normalized, Date.now());
-  return result.ok === true;
-}
-
-async function notifyPairingLifecycle(phone, payload = {}) {
-  if (!PAIRING_SUCCESS_WEBHOOK_URL) return false;
-  const normalized = normalizePhone(phone);
-  if (!normalized) return false;
-  try {
-    const response = await fetch(PAIRING_SUCCESS_WEBHOOK_URL, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        number: normalized,
-        phone: normalized,
-        linked: true,
-        connected: true,
-        registered: true,
-        success: true,
-        paired: true,
-        authorised: true,
-        authorized: true,
-        typeWebhook: 'stateInstanceChanged',
-        stateInstance: 'authorized',
-        timestamp: Date.now(),
-        source: 'local-pairing-runtime',
-        ...payload,
-      }),
-    });
-    return response.ok;
-  } catch (error) {
-    console.error('Failed to notify pairing lifecycle for', normalized, error?.message || error);
-    return false;
-  }
-}
-
-async function runSessionWatchdog() {
-  try {
-    const index = await readSessionIndex();
-    const sessions = index.sessions || {};
-    for (const phone of Object.keys(sessions)) {
-      const normalized = normalizePhone(phone);
-      const info = sessions[normalized] || sessions[phone] || {};
-      const shouldBeAlive = info.registered === true || info.connected === true;
-      if (!normalized || !shouldBeAlive) continue;
-      if (sockets.has(normalized) || startPromises.has(normalized) || reconnectTimers.has(normalized)) continue;
-      createSocket(normalized, { bootRestore: true }).catch((error) => {
-        console.error('Watchdog restore failed for', normalized, error?.message || error);
-        scheduleReconnect(normalized);
-      });
-    }
-  } catch (error) {
-    console.error('Session watchdog failed:', error?.message || error);
-  }
-}
-
 function startHeartbeat(sock, phone) {
   const normalized = normalizePhone(phone);
   if (!sock || !normalized) return;
@@ -561,7 +457,7 @@ async function requestPairingCodeWithRetry(sock, phone) {
     throw new Error('الرقم مربوط بالفعل والجلسة جاهزة.');
   }
 
-  const waits = [0, 400, 900, 1500, 2500];
+  const waits = [1200, 2500, 4500, 7000];
   let lastError = new Error('Pairing code request failed');
   for (const waitMs of waits) {
     try {
@@ -582,7 +478,6 @@ async function requestPairingCodeWithRetry(sock, phone) {
 async function handleConnectionOpened(sock, phone, state) {
   const normalized = normalizePhone(phone);
   const nowIso = new Date().toISOString();
-  const hadPendingPairing = pairingRequests.has(normalized);
   pairingRequests.delete(normalized);
   clearReconnect(normalized);
 
@@ -606,13 +501,6 @@ async function handleConnectionOpened(sock, phone, state) {
       connectedAt: nowIso,
     });
   } catch (_) {}
-
-  if (hadPendingPairing) {
-    sendDirectLinkedNotice(sock, normalized, true).catch((error) => {
-      console.error('Failed to send direct linked notice for', normalized, error?.message || error);
-    });
-    notifyPairingLifecycle(normalized, { lastConnectedAt: nowIso }).catch(() => {});
-  }
 }
 
 async function createSocket(phone, options = {}) {
@@ -772,7 +660,7 @@ app.get('/api/session-status', async (req, res) => {
   return res.json({ success: true, session: index.sessions?.[phone] || null, active: sockets.has(phone), bridgeSocket: !!pairingBridge.getSocket(phone) });
 });
 
-app.all(['/api/pairing', '/pair'], async (req, res) => {
+app.all('/api/pairing', async (req, res) => {
   const phone = pickPhone(req);
   if (!phone) return res.status(400).json({ success: false, error: 'أدخل الرقم أولاً' });
 
@@ -838,13 +726,6 @@ app.delete('/api/session/:phone', async (req, res) => {
   return res.json({ success: true, deleted: true, phone });
 });
 
-app.post('/unpair', async (req, res) => {
-  const phone = pickPhone(req);
-  if (!phone) return res.status(400).json({ success: false, error: 'phone is required' });
-  await purgeSession(phone, { removeRemote: true });
-  return res.json({ success: true, deleted: true, phone });
-});
-
 process.on('SIGINT', async () => {
   for (const timer of reconnectTimers.values()) clearTimeout(timer);
   for (const phone of Array.from(sockets.keys())) await destroySocket(phone);
@@ -860,9 +741,5 @@ process.on('SIGTERM', async () => {
 app.listen(PORT, '0.0.0.0', async () => {
   await ensureSessionRoot();
   await restoreAllSessionsOnBoot();
-  const watchdogTimer = setInterval(() => {
-    runSessionWatchdog().catch(() => {});
-  }, SESSION_WATCHDOG_INTERVAL_MS);
-  if (typeof watchdogTimer.unref === 'function') watchdogTimer.unref();
   console.log(`Local pairing server listening on ${PORT}`);
 });

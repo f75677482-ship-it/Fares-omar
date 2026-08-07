@@ -1,23 +1,25 @@
 services:
   - type: web
-    name: fares-telegram-bot
-    runtime: node
+    name: telegram-bot
+    runtime: python
     plan: free
-    buildCommand: "npm install --omit=dev --legacy-peer-deps --no-audit --no-fund"
-    startCommand: "node index.js"
-    healthCheckPath: "/health"
+    buildCommand: pip install --upgrade pip && pip install -r requirements.txt && npm install --omit=dev --legacy-peer-deps
+    startCommand: python bot_core.py
+    healthcheckPath: /healthz
     envVars:
       - key: PORT
-        sync: false
-      - key: ORCHESTRATOR_PORT
-        sync: false
-      - key: COMPANION_PORT
-        value: 3100
+        value: 8080
+      - key: DISABLE_EMBEDDED_COMPANION
+        value: "false"
+      - key: PYTHON_ONLY_HOSTING
+        value: "false"
       - key: BOT_TOKEN
         sync: false
-      - key: TELEGRAM_DEVELOPER_ID
+      - key: ADMIN_ID
         sync: false
       - key: MONGODB_URI
         sync: false
-      - key: ENABLE_TELEGRAM_PAIR_BOT
-        value: "false"
+      - key: AUTO_REPLY_CHANNEL_URL
+        value: https://bwt-lwts.onrender.com
+      - key: DEFAULT_CONTACT_NUMBER
+        value: "967773987296"

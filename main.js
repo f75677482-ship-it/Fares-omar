@@ -591,7 +591,6 @@ function patchArabicOutgoingSock(sock) {
 }
 
 async function handleMessages(sock, messageUpdate, printLog) {
-    let chatId = '';
     try {
         const { messages, type } = messageUpdate;
         if (type !== 'notify') return;
@@ -610,7 +609,7 @@ async function handleMessages(sock, messageUpdate, printLog) {
             return;
         }
 
-        chatId = message.key.remoteJid;
+        const chatId = message.key.remoteJid;
         const senderId = message.key.participant || message.key.remoteJid;
         const isGroup = chatId.endsWith('@g.us');
         const senderIsSudo = await isSudo(senderId);
