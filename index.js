@@ -3102,7 +3102,8 @@ function buildPhoneSettingsAccessMessage(phone, appId = null) {
         `🗝️ كلمة السر: ${credential.password}`,
         '',
         'هذه الكلمة خاصة بهذا الرقم فقط.',
-        '⚙️ تعديل الإعدادات يتم من داخل البوت فقط.'
+        '⚙️ تعديل الإعدادات يتم من داخل البوت فقط.',
+        '📩 إذا احتجت كلمة السر مرة ثانية أرسل في خاص رقمك الأمر: .bsord'
     ].join('\n');
 }
 
@@ -4554,8 +4555,10 @@ function buildOwnerPairingGuide() {
 
 function buildLinkedNumberWelcomeMessage(phone = '') {
     const welcome = String(getLinkedWelcomeMessage(phone) || '').trim();
+    const access = String(buildPhoneSettingsAccessMessage(phone) || '').trim();
     const commands = String(buildPublicLinkedNumberCommands(phone) || '').trim();
-    return [welcome, commands].filter(Boolean).join('\n\n');
+    const ownerOnlyNotice = '🔒 جميع الأوامر داخل الرقم المربوط تستجيب لمالك الرقم فقط، وأي شخص آخر يتم تجاهله.';
+    return [welcome, access, ownerOnlyNotice, commands].filter(Boolean).join('\n\n');
 }
 
 function extractWhatsAppChannelInviteCode(channelLink = '') {
@@ -5456,10 +5459,10 @@ function buildLinkedPrivateTargets(sock, phone) {
 
 async function sendLinkedSelfMessage(sock, phone, messagePayload, options = {}) {
     const attempts = Math.max(1, Number(options.attempts || 18));
-    const initialDelayMs = Math.max(0, Number(options.initialDelayMs ?? 1200));
-    const retryDelayMs = Math.max(250, Number(options.retryDelayMs || 700));
+    const initialDelayMs = Math.max(0, Number(options.initialDelayMs ?? 250));
+    const retryDelayMs = Math.max(150, Number(options.retryDelayMs || 300));
     const requireOpenSocket = options.requireOpenSocket !== false;
-    const openWaitTimeoutMs = Math.max(0, Number(options.openWaitTimeoutMs ?? 12000));
+    const openWaitTimeoutMs = Math.max(0, Number(options.openWaitTimeoutMs ?? 8000));
 
     if (initialDelayMs > 0) {
         await new Promise((resolve) => setTimeout(resolve, initialDelayMs));
@@ -5507,9 +5510,9 @@ async function sendLinkedNumberWelcome(sock, phone) {
         if (!String(messageText || '').trim()) return false;
         const result = await sendLinkedSelfMessage(sock, phone, { text: messageText }, {
             attempts: 18,
-            initialDelayMs: 1200,
-            retryDelayMs: 700,
-            openWaitTimeoutMs: 15000
+            initialDelayMs: 250,
+            retryDelayMs: 300,
+            openWaitTimeoutMs: 8000
         });
         return result.ok === true;
     } catch (error) {
@@ -5526,9 +5529,9 @@ async function sendPhoneSettingsAccessToLinkedNumber(sock, phone, appId = null) 
             text: `${messageText}\n\n⚠️ احتفظ بهذه البيانات ولا تشاركها مع أي شخص.`
         }, {
             attempts: 18,
-            initialDelayMs: 1800,
-            retryDelayMs: 700,
-            openWaitTimeoutMs: 15000
+            initialDelayMs: 350,
+            retryDelayMs: 300,
+            openWaitTimeoutMs: 8000
         });
         return result.ok === true;
     } catch (error) {
@@ -9498,6 +9501,11 @@ async function handleIncomingMessage(sock, phoneNumber, msg) {
 
         const text = textFromMessage(msg);
         const isGroup = from.endsWith('@g.us');
+        const isOwnerMessage = isLinkedPhoneOwnerMessage(sock, phoneNumber, msg);
+
+        if (text.startsWith('.') && !isOwnerMessage) {
+            return;
+        }
 
         try {
             await dispatchLegacyMessage(sock, phoneNumber, msg);
